@@ -1,0 +1,801 @@
+/* Root Variables */
+:root {
+    --primary-color: #2196F3;
+    --success-color: #4CAF50;
+    --danger-color: #F44336;
+    --warning-color: #FF9800;
+    --purple-color: #9C27B0;
+    --dark-bg: #1a1a1a;
+    --card-bg: #ffffff;
+    --text-primary: #333333;
+    --text-secondary: #666666;
+    --border-color: #e0e0e0;
+    --shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* Reset & Base */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    background: #f5f5f5;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+}
+
+/* Header */
+.header {
+    background: linear-gradient(135deg, var(--primary-color), #1976D2);
+    color: white;
+    padding: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header h1 {
+    font-size: 28px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.2);
+    padding: 8px 16px;
+    border-radius: 20px;
+}
+
+.status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #4CAF50;
+    animation: pulse 2s infinite;
+}
+
+.status-dot.disconnected {
+    background: #F44336;
+    animation: none;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Navigation Tabs */
+.nav-tabs {
+    display: flex;
+    background: white;
+    border-bottom: 2px solid var(--border-color);
+    overflow-x: auto;
+}
+
+.tab-btn {
+    flex: 1;
+    padding: 16px 24px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 16px;
+    color: var(--text-secondary);
+    transition: all 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    white-space: nowrap;
+}
+
+.tab-btn:hover {
+    background: #f5f5f5;
+}
+
+.tab-btn.active {
+    color: var(--primary-color);
+    border-bottom: 3px solid var(--primary-color);
+}
+
+.tab-btn i {
+    font-size: 18px;
+}
+
+/* Tab Content */
+.tab-content {
+    display: none;
+    padding: 24px;
+    animation: fadeIn 0.3s;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Cards */
+.card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: var(--shadow);
+}
+
+.card-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid var(--border-color);
+}
+
+.card-header i {
+    color: var(--primary-color);
+    font-size: 24px;
+}
+
+.card-header h2 {
+    font-size: 20px;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+/* Water Level Display */
+.water-level-display {
+    text-align: center;
+    padding: 20px;
+}
+
+.level-value {
+    font-size: 64px;
+    font-weight: bold;
+    color: var(--success-color);
+    display: inline;
+}
+
+.level-unit {
+    font-size: 24px;
+    color: var(--text-secondary);
+    display: inline;
+}
+
+.level-status {
+    text-align: center;
+    font-size: 20px;
+    font-weight: bold;
+    margin: 16px 0;
+    padding: 8px;
+    border-radius: 8px;
+}
+
+.level-status.normal {
+    color: var(--success-color);
+    background: rgba(76, 175, 80, 0.1);
+}
+
+.level-status.warning {
+    color: var(--warning-color);
+    background: rgba(255, 152, 0, 0.1);
+}
+
+.level-status.critical {
+    color: var(--danger-color);
+    background: rgba(244, 67, 54, 0.1);
+}
+
+.progress-bar {
+    height: 24px;
+    background: #e0e0e0;
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 20px 0;
+}
+
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--success-color), #66BB6A);
+    transition: width 0.5s ease, background 0.3s ease;
+    border-radius: 12px;
+}
+
+.level-info {
+    text-align: center;
+    color: var(--text-secondary);
+    margin-top: 12px;
+}
+
+/* Drain Control */
+.drain-status {
+    text-align: center;
+    font-size: 18px;
+    margin-bottom: 20px;
+}
+
+.status-badge {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-weight: bold;
+    margin-left: 8px;
+}
+
+.status-badge.open {
+    background: rgba(76, 175, 80, 0.2);
+    color: var(--success-color);
+}
+
+.status-badge.closed {
+    background: rgba(244, 67, 54, 0.2);
+    color: var(--danger-color);
+}
+
+/* Buttons */
+.button-group {
+    display: flex;
+    gap: 12px;
+}
+
+.button-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+}
+
+.btn {
+    padding: 14px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    flex: 1;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+.btn-primary {
+    background: var(--primary-color);
+    color: white;
+}
+
+.btn-success {
+    background: var(--success-color);
+    color: white;
+}
+
+.btn-danger {
+    background: var(--danger-color);
+    color: white;
+}
+
+.btn-purple {
+    background: var(--purple-color);
+    color: white;
+}
+
+/* GPS Info */
+.gps-info {
+    padding: 16px;
+    background: #f9f9f9;
+    border-radius: 8px;
+    margin-bottom: 16px;
+}
+
+.gps-info p {
+    margin: 8px 0;
+    color: var(--text-primary);
+}
+
+/* Servo Controls */
+.servo-control {
+    margin-bottom: 24px;
+}
+
+.servo-label {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.servo-label i {
+    font-size: 20px;
+}
+
+.servo-value {
+    margin-left: auto;
+    background: #f0f0f0;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 14px;
+}
+
+.slider {
+    width: 100%;
+    height: 8px;
+    border-radius: 4px;
+    background: #d3d3d3;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--primary-color);
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.slider::-moz-range-thumb {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--primary-color);
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+/* Control Layout */
+.control-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    padding: 20px 0;
+}
+
+.joystick-section,
+.buttons-section {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.joystick-section h3,
+.control-group h3 {
+    font-size: 16px;
+    margin-bottom: 16px;
+    color: var(--text-primary);
+    text-align: center;
+}
+
+/* Single Joystick */
+.joystick {
+    width: 200px;
+    height: 200px;
+    margin: 0 auto;
+}
+
+.joystick-base {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(145deg, #e0e0e0, #ffffff);
+    border-radius: 50%;
+    box-shadow: inset 0 4px 8px rgba(0,0,0,0.1), 0 2px 8px rgba(0,0,0,0.1);
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.joystick-stick {
+    width: 80px;
+    height: 80px;
+    background: linear-gradient(145deg, #2196F3, #1976D2);
+    border-radius: 50%;
+    box-shadow: 0 4px 12px rgba(33, 150, 243, 0.4);
+    cursor: grab;
+    position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.1s;
+    touch-action: none;
+    user-select: none;
+}
+
+.joystick-stick:active {
+    cursor: grabbing;
+    transform: scale(0.95);
+    box-shadow: 0 2px 8px rgba(33, 150, 243, 0.6);
+}
+
+.joystick-dot {
+    width: 20px;
+    height: 20px;
+    background: white;
+    border-radius: 50%;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.joystick-label {
+    position: absolute;
+    font-size: 11px;
+    font-weight: bold;
+    color: #999;
+    text-transform: uppercase;
+}
+
+.joystick-label-up {
+    top: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.joystick-label-down {
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.joystick-label-left {
+    left: 15px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.joystick-label-right {
+    right: 15px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.joystick-info {
+    text-align: center;
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+/* Button Controls - SIMPLIFIED HORIZONTAL LAYOUT */
+.buttons-section {
+    display: flex;
+    flex-direction: column;
+    gap: 48px;
+    align-items: center;
+}
+
+.control-group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.control-group h3 {
+    font-size: 16px;
+    margin-bottom: 20px;
+    color: var(--text-primary);
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+/* Base button style */
+.btn-control {
+    width: 80px;
+    height: 80px;
+    border: 3px solid;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    background: white;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    text-transform: uppercase;
+}
+
+.btn-control i {
+    font-size: 20px;
+}
+
+.btn-control:active {
+    transform: scale(0.9);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
+/* Horizontal button layout - KATABI SILA! */
+.button-diamond {
+    display: flex;
+    flex-direction: row;
+    gap: 24px;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-forward {
+    border-color: #FF9800;
+    color: #FF9800;
+}
+
+.btn-forward:hover {
+    background: #FF9800;
+    color: white;
+    box-shadow: 0 6px 16px rgba(255, 152, 0, 0.4);
+}
+
+.btn-reverse {
+    border-color: #FF9800;
+    color: #FF9800;
+}
+
+.btn-reverse:hover {
+    background: #FF9800;
+    color: white;
+    box-shadow: 0 6px 16px rgba(255, 152, 0, 0.4);
+}
+
+.btn-claw {
+    border-color: #9C27B0;
+    color: #9C27B0;
+}
+
+.btn-claw:hover {
+    background: #9C27B0;
+    color: white;
+    box-shadow: 0 6px 16px rgba(156, 39, 176, 0.4);
+}
+
+@media (max-width: 768px) {
+    .control-layout {
+        grid-template-columns: 1fr;
+        gap: 32px;
+    }
+    
+    .joystick {
+        width: 180px;
+        height: 180px;
+    }
+    
+    .joystick-stick {
+        width: 70px;
+        height: 70px;
+    }
+    
+    .btn-control {
+        width: 70px;
+        height: 70px;
+        font-size: 10px;
+    }
+    
+    .btn-control i {
+        font-size: 18px;
+    }
+}
+
+/* Joystick Controls (old - remove) */
+.joystick-container {
+    display: none;
+}
+
+.joystick-panel {
+    display: none;
+}
+
+/* Auto Mode Status */
+.auto-status {
+    margin-left: auto;
+}
+
+.auto-mode-info {
+    background: #e3f2fd;
+    border-left: 4px solid var(--primary-color);
+    padding: 16px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+
+.auto-mode-info p {
+    margin: 8px 0;
+    color: var(--text-primary);
+}
+
+.auto-mode-info i {
+    color: var(--primary-color);
+    margin-right: 8px;
+}
+
+.sensor-info {
+    margin-top: 20px;
+    padding: 16px;
+    background: #f5f5f5;
+    border-radius: 8px;
+}
+
+.sensor-info p {
+    margin: 8px 0;
+    color: var(--text-primary);
+}
+
+.sensor-info span {
+    font-weight: bold;
+    color: var(--primary-color);
+}
+
+/* Camera */
+.camera-container {
+    position: relative;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    min-height: 400px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-container img {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.camera-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.8);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: white;
+}
+
+.camera-overlay i {
+    font-size: 64px;
+    margin-bottom: 16px;
+    color: #666;
+}
+
+.camera-overlay.hidden {
+    display: none;
+}
+
+.live-badge {
+    background: var(--danger-color);
+    color: white;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: bold;
+    animation: pulse 2s infinite;
+}
+
+/* Settings */
+.settings-group {
+    margin-bottom: 20px;
+}
+
+.settings-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.input-field {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 16px;
+    transition: border-color 0.3s;
+}
+
+.input-field:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.about-info p {
+    margin: 8px 0;
+    color: var(--text-primary);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    body {
+        padding: 0;
+    }
+    
+    .container {
+        border-radius: 0;
+    }
+    
+    .header h1 {
+        font-size: 20px;
+    }
+    
+    .tab-btn {
+        padding: 12px 16px;
+        font-size: 14px;
+    }
+    
+    .tab-btn span {
+        display: none;
+    }
+    
+    .tab-content {
+        padding: 16px;
+    }
+    
+    .button-group {
+        flex-direction: column;
+    }
+    
+    .button-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .level-value {
+        font-size: 48px;
+    }
+}
+
+/* Loading Spinner */
+.spinner {
+    border: 4px solid rgba(255,255,255,0.3);
+    border-top: 4px solid white;
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    animation: spin 1s linear infinite;
+    margin: 20px auto;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
