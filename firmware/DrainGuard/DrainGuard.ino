@@ -248,6 +248,7 @@ class BleWriteCB : public BLECharacteristicCallbacks {
 // Commands phone sends (JSON written to RX characteristic):
 //   {"command":"scan_wifi"}
 //   {"command":"set_wifi","ssid":"MyNet","password":"secret"}
+//   {"command":"forget_wifi"}
 //
 // Responses ESP32 notifies back (TX characteristic):
 //   {"status":"ready","device":"DrainGuard-XXXX","hotspot_ip":"192.168.4.1"}
@@ -257,6 +258,7 @@ class BleWriteCB : public BLECharacteristicCallbacks {
 //   {"status":"connecting","ssid":"MyNet"}
 //   {"status":"connected","ssid":"MyNet","ip":"192.168.1.55","saved":true}
 //   {"status":"failed","reason":"authentication_failed"}
+//   {"status":"forgotten","configured":false,"hotspot_ip":"192.168.4.1"}
 
 void handleBleWrite(const String &json) {
   Serial.printf("[BLE] Received: %s\n", json.c_str());
@@ -282,6 +284,35 @@ void handleBleWrite(const String &json) {
     }
     wifiScanInProgress = true;
     bleNotify("{\"status\":\"scanning_wifi\"}");
+    return;
+  }
+
+  // forget_wifi - clear the saved uplink without stopping the robot hotspot
+  if (strcmp(cmd, "forget_wifi") == 0) {
+    if (wifiScanInProgress) {
+      WiFi.scanDelete();
+      wifiScanInProgress = false;
+    }
+    wifiConnState = WCS_IDLE;
+    saveOnSuccess = false;
+    pendingSsid = "";
+    pendingPass = "";
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, true);
+    WiFi.mode(WIFI_AP_STA);
+
+    bool cleared = false;
+    if (prefs.begin(NVS_NAMESPACE, false)) {
+      cleared = prefs.clear();
+      prefs.end();
+    }
+    if (!cleared) {
+      bleNotify("{\"status\":\"clear_failed\",\"message\":\"Unable to clear saved WiFi credentials\"}");
+      return;
+    }
+
+    bleNotify("{\"status\":\"forgotten\",\"configured\":false,\"hotspot_ip\":\"" AP_IP "\"}");
+    Serial.println("[NVS] Saved WiFi credentials cleared; hotspot remains active");
     return;
   }
 
@@ -312,6 +343,7 @@ void startWifiConnection(const String &ssid, const String &pass, bool save) {
   wifiConnState   = WCS_CONNECTING;
   wifiConnStartAt = millis();
 
+  WiFi.setAutoReconnect(true);
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_AP_STA);         // keep hotspot alive while connecting
   WiFi.begin(ssid.c_str(), pass.c_str());
@@ -338,6 +370,7 @@ void updateWifiState() {
     doc["status"] = "connected";
     doc["ssid"]   = pendingSsid;
     doc["ip"]     = WiFi.localIP().toString();
+    doc["hotspot_ip"] = AP_IP;
     doc["saved"]  = saved;
     String out; serializeJson(doc, out);
     bleNotify(out);
@@ -435,9 +468,11 @@ void loadSavedCredentials(String &ssid, String &pass) {
 
 bool saveCredentials(const String &ssid, const String &pass) {
   if (!prefs.begin(NVS_NAMESPACE, false)) return false;
-  bool ok = prefs.putString(NVS_KEY_SSID, ssid) > 0
-         && prefs.putString(NVS_KEY_PASS, pass) > 0
-         && prefs.putBool(NVS_KEY_SAVED, true)  > 0;
+  bool ssidSaved = prefs.putString(NVS_KEY_SSID, ssid) == ssid.length();
+  // An empty password is valid for an open WiFi network.
+  prefs.putString(NVS_KEY_PASS, pass);
+  bool configuredSaved = prefs.putBool(NVS_KEY_SAVED, true) > 0;
+  bool ok = ssidSaved && configuredSaved;
   prefs.end();
   if (ok) Serial.printf("[NVS] Saved SSID: %s\n", ssid.c_str());
   return ok;

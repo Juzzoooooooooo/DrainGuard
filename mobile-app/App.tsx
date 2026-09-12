@@ -212,6 +212,16 @@ function App() {
     [settings],
   );
 
+  const useHotspotDeviceIp = useCallback(async () => {
+    const nextSettings = {
+      ...settings,
+      deviceIp: DEFAULT_SETTINGS.deviceIp,
+    };
+    await persistSettings(nextSettings);
+    setSettings(nextSettings);
+    setConnected(null);
+  }, [settings]);
+
   const toastView = toast ? (
     <Toast
       key={toast.id}
@@ -262,6 +272,7 @@ function App() {
           ) : (
             <SettingsScreen
               notify={notify}
+              onForgetWifi={useHotspotDeviceIp}
               onProvisioned={useProvisionedDeviceIp}
               onSave={updateSettings}
               settings={settings}

@@ -239,15 +239,28 @@ bool WiFiProvisioningManager::saveConfiguration() {
     return false;
   }
 
-  bool saved =
-    preferences.putString("ssid", activeSsid) > 0 &&
-    preferences.putString("password", activePassword) > 0 &&
-    preferences.putString("api_endpoint", activeApiEndpoint) > 0 &&
-    preferences.putBool("configured", true) > 0;
+  // putString() returns zero for a valid empty value. Do not treat an empty
+  // password as a write failure because open WiFi networks are supported.
+  bool savedSsid = preferences.putString("ssid", activeSsid) == activeSsid.length();
+  preferences.putString("password", activePassword);
+  bool savedEndpoint =
+    preferences.putString("api_endpoint", activeApiEndpoint) == activeApiEndpoint.length();
+  bool savedFlag = preferences.putBool("configured", true) > 0;
+  bool saved = savedSsid && savedEndpoint && savedFlag;
 
   preferences.end();
   hasStoredConfiguration = saved;
   return saved;
+}
+
+bool WiFiProvisioningManager::clearStoredConfiguration() {
+  if (!preferences.begin(PREFERENCES_NAMESPACE, false)) {
+    return false;
+  }
+
+  bool cleared = preferences.clear();
+  preferences.end();
+  return cleared;
 }
 
 void WiFiProvisioningManager::update() {
@@ -331,6 +344,8 @@ void WiFiProvisioningManager::enqueuePayload(const String &payload) {
 
   if (strcmp(commandName, "scan_wifi") == 0) {
     command.type = COMMAND_SCAN_WIFI;
+  } else if (strcmp(commandName, "forget_wifi") == 0) {
+    command.type = COMMAND_FORGET_WIFI;
   } else if (strcmp(commandName, "set_wifi") == 0) {
     const char *ssid = document["ssid"] | "";
     const char *password = document["password"] | "";
@@ -375,6 +390,11 @@ void WiFiProvisioningManager::processCommand(const ProvisioningCommand &command)
     return;
   }
 
+  if (command.type == COMMAND_FORGET_WIFI) {
+    forgetWifi();
+    return;
+  }
+
   startWifiConnection(
     String(command.ssid),
     String(command.password),
@@ -401,6 +421,7 @@ void WiFiProvisioningManager::startWifiConnection(
   connectionState = WIFI_CONNECTING;
   connectionStartedAt = millis();
 
+  WiFi.setAutoReconnect(true);
   WiFi.disconnect(false, false);
   // AP+STA keeps the private robot hotspot online while optionally connecting
   // the station interface to a provisioned internet network.
@@ -437,6 +458,7 @@ void WiFiProvisioningManager::updateWifiConnection() {
     document["status"] = "connected";
     document["ssid"] = activeSsid;
     document["ip"] = WiFi.localIP().toString();
+    document["hotspot_ip"] = WiFi.softAPIP().toString();
     document["saved"] = saved;
     String payload;
     serializeJson(document, payload);
@@ -468,6 +490,44 @@ void WiFiProvisioningManager::updateWifiConnection() {
 
     Serial.printf("WiFi connection failed: %s\n", wifiFailureReason(finalStatus));
   }
+}
+
+void WiFiProvisioningManager::forgetWifi() {
+  if (wifiScanInProgress) {
+    WiFi.scanDelete();
+    wifiScanInProgress = false;
+  }
+
+  connectionState = WIFI_IDLE;
+  persistPendingCredentials = false;
+  WiFi.setAutoReconnect(false);
+  // Disconnect only the station interface and erase the Arduino WiFi stack's
+  // remembered AP. WIFI_AP_STA keeps the private robot hotspot online.
+  WiFi.disconnect(false, true);
+  WiFi.mode(WIFI_AP_STA);
+
+  bool cleared = clearStoredConfiguration();
+  hasStoredConfiguration = false;
+  activeSsid = "";
+  activePassword = "";
+  activeApiEndpoint = "";
+
+  if (!cleared) {
+    notifyStatus("clear_failed", "Unable to clear saved WiFi credentials");
+    Serial.println("Failed to clear saved WiFi credentials");
+    return;
+  }
+
+  StaticJsonDocument<192> document;
+  document["status"] = "forgotten";
+  document["configured"] = false;
+  document["hotspot_ip"] = WiFi.softAPIP().toString();
+  String payload;
+  serializeJson(document, payload);
+  statusCharacteristic->setValue(payload.c_str());
+  if (bleClientConnected) statusCharacteristic->notify();
+
+  Serial.println("Saved WiFi credentials cleared; private hotspot remains active");
 }
 
 void WiFiProvisioningManager::startWifiScan() {

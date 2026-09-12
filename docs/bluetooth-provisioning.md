@@ -11,7 +11,7 @@ DrainGuard uses Bluetooth Low Energy (BLE) GATT provisioning so the same workflo
 5. Enter the WiFi password and, optionally, a telemetry API endpoint.
 6. Tap **Configure WiFi**.
 7. The ESP32 reports `connecting`, followed by `connected` or `failed`. A connection attempt times out after 30 seconds.
-8. After success, the ESP32 stores the credentials in NVS and the app saves the device ID, name, SSID, and assigned IP address. The password is never stored by the app.
+8. After success, the ESP32 stores the credentials in NVS. The app keeps using the private hotspot address for camera and arm controls; the password is never stored by the app.
 
 If connection fails, BLE remains available and the user can correct the credentials and retry without rebooting or reflashing the ESP32.
 
@@ -72,6 +72,12 @@ Scan WiFi networks:
 { "command": "scan_wifi" }
 ```
 
+Forget the saved uplink credentials while leaving the private robot hotspot active:
+
+```json
+{ "command": "forget_wifi" }
+```
+
 Status notifications include:
 
 | Status | Meaning |
@@ -81,8 +87,10 @@ Status notifications include:
 | `network` | One discovered network; includes `ssid`, `rssi`, and `secure` |
 | `scan_complete` | Network scan completed |
 | `connecting` | ESP32 is attempting to join the supplied SSID |
-| `connected` | WiFi connected; includes `ssid`, `ip`, and `saved` |
+| `connected` | WiFi connected; includes `ssid`, station `ip`, `hotspot_ip`, and `saved` |
 | `failed` | WiFi failed; includes a machine-readable `reason` |
+| `forgotten` | Saved uplink credentials were cleared; the hotspot remains active |
+| `clear_failed` | Saved uplink credentials could not be cleared |
 | `invalid` | Malformed or invalid command |
 | `busy` | Command queue is full |
 

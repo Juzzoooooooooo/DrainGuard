@@ -20,6 +20,7 @@ interface SettingsScreenProps {
   settings: AppSettings;
   onSave: (settings: AppSettings) => Promise<void>;
   onProvisioned: (deviceIp: string) => Promise<void>;
+  onForgetWifi: () => Promise<void>;
   notify: (message: string, kind?: ToastKind) => void;
 }
 
@@ -60,6 +61,7 @@ export function SettingsScreen({
   settings,
   onSave,
   onProvisioned,
+  onForgetWifi,
   notify,
 }: SettingsScreenProps) {
   const [deviceIp, setDeviceIp] = useState(settings.deviceIp);
@@ -140,6 +142,7 @@ export function SettingsScreen({
 
           <WifiProvisioning
             notify={notify}
+            onForgetWifi={onForgetWifi}
             onProvisioned={async nextDeviceIp => {
               setDeviceIp(nextDeviceIp);
               await onProvisioned(nextDeviceIp);

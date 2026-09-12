@@ -240,6 +240,17 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
   }
 
   @ReactMethod
+  public void forgetWifi(Promise promise) {
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", "forget_wifi");
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create the forget Wi-Fi command.", error);
+    }
+  }
+
+  @ReactMethod
   public void provisionWifi(
       String ssid,
       String password,

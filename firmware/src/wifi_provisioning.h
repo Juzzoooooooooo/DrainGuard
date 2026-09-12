@@ -39,6 +39,7 @@ private:
   enum CommandType : uint8_t {
     COMMAND_SET_WIFI,
     COMMAND_SCAN_WIFI,
+    COMMAND_FORGET_WIFI,
   };
 
   enum ConnectionState : uint8_t {
@@ -59,6 +60,7 @@ private:
   void initializeHotspot();
   void loadStoredConfiguration();
   bool saveConfiguration();
+  bool clearStoredConfiguration();
   void enqueuePayload(const String &payload);
   void processCommand(const ProvisioningCommand &command);
   void startWifiConnection(
@@ -70,6 +72,7 @@ private:
   void updateWifiConnection();
   void startWifiScan();
   void updateWifiScan();
+  void forgetWifi();
   void restartAdvertisingIfNeeded();
   void notifyReady();
   void notifyStatus(const String &status, const String &message = "");

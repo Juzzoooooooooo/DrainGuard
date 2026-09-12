@@ -66,7 +66,12 @@ export function CameraScreen({
     setStreamUrl('');
     try {
       const nextUrl = await loadStreamUrl();
-      setStreamUrl(nextUrl);
+      if (nextUrl) {
+        setStreamUrl(nextUrl);
+      } else {
+        // No camera connected — show placeholder but keep controls working
+        setStreamState('error');
+      }
     } catch {
       setStreamUrl('');
       setStreamState('error');

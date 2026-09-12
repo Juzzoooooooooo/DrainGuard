@@ -381,8 +381,12 @@ void setupAPIEndpoints() {
   // Get camera stream URL
   server.on("/api/camera/stream", HTTP_GET, []() {
     String streamUrl = camera.getStreamURL();
-    server.send(200, "application/json", 
-                "{\"stream_url\":\"" + streamUrl + "\"}");
+    StaticJsonDocument<192> doc;
+    doc["available"] = camera.isConnected();
+    doc["stream_url"] = streamUrl;
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
   });
   
   // Get GPS location

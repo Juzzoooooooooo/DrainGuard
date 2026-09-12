@@ -45,6 +45,7 @@ interface DrainGuardBleNativeModule {
   disconnect(): Promise<void>;
   openBluetoothSettings(): Promise<void>;
   scanWifi(): Promise<void>;
+  forgetWifi(): Promise<void>;
   provisionWifi(
     ssid: string,
     password: string,
@@ -127,6 +128,10 @@ export const bleProvisioning = {
 
   scanWifi() {
     return requireAndroidModule().scanWifi();
+  },
+
+  forgetWifi() {
+    return requireAndroidModule().forgetWifi();
   },
 
   provisionWifi(ssid: string, password: string) {

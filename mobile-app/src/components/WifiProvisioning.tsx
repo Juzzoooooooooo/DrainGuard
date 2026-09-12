@@ -22,10 +22,13 @@ import {Card} from './Card';
 interface WifiProvisioningProps {
   notify: (message: string, kind?: ToastKind) => void;
   onProvisioned: (deviceIp: string) => Promise<void>;
+  onForgetWifi?: () => Promise<void>;
 }
 
 const DEVICE_SCAN_TIMEOUT_MS = 12500;
 const WIFI_SETUP_TIMEOUT_MS = 35000;
+const FORGET_WIFI_TIMEOUT_MS = 5000;
+const DEFAULT_HOTSPOT_IP = '192.168.4.1';
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Bluetooth operation failed.';
@@ -44,6 +47,7 @@ function signalLabel(rssi: number) {
 export function WifiProvisioning({
   notify,
   onProvisioned,
+  onForgetWifi,
 }: WifiProvisioningProps) {
   const [devices, setDevices] = useState<DrainGuardBleDevice[]>([]);
   const [selectedDevice, setSelectedDevice] =
@@ -56,6 +60,7 @@ export function WifiProvisioning({
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
+  const [forgettingWifi, setForgettingWifi] = useState(false);
   const [statusMessage, setStatusMessage] = useState(
     'Scan for your DrainGuard controller to begin.',
   );
@@ -65,7 +70,15 @@ export function WifiProvisioning({
   } | null>(null);
   const deviceScanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wifiSetupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const forgetWifiTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const provisioningActive = useRef(false);
+  const onProvisionedRef = useRef(onProvisioned);
+  const onForgetWifiRef = useRef(onForgetWifi);
+
+  useEffect(() => {
+    onProvisionedRef.current = onProvisioned;
+    onForgetWifiRef.current = onForgetWifi;
+  }, [onForgetWifi, onProvisioned]);
 
   useEffect(() => {
     const deviceSubscription = bleProvisioning.onDevice(device => {
@@ -107,6 +120,9 @@ export function WifiProvisioning({
       }
       if (wifiSetupTimer.current) {
         clearTimeout(wifiSetupTimer.current);
+      }
+      if (forgetWifiTimer.current) {
+        clearTimeout(forgetWifiTimer.current);
       }
       bleProvisioning.stopScan().catch(() => undefined);
       bleProvisioning.disconnect().catch(() => undefined);
@@ -161,9 +177,26 @@ export function WifiProvisioning({
       if (status.ssid) {
         notify(`DrainGuard connected to ${status.ssid}.`, 'success');
       }
-      if (status.ip) {
-        onProvisioned(status.ip).catch(() => undefined);
+      // The station IP is only for the optional internet uplink. Camera and
+      // arm controls must continue through the private robot hotspot.
+      const localControlIp = status.hotspot_ip ?? DEFAULT_HOTSPOT_IP;
+      onProvisionedRef.current(localControlIp).catch(() => undefined);
+      return;
+    }
+    if (status.status === 'forgotten') {
+      setForgettingWifi(false);
+      if (forgetWifiTimer.current) {
+        clearTimeout(forgetWifiTimer.current);
+        forgetWifiTimer.current = null;
       }
+      setConnectedWifi(null);
+      setSsid('');
+      setPassword('');
+      setStatusMessage(
+        'Saved Wi-Fi cleared. The private DrainGuard hotspot is still active.',
+      );
+      onForgetWifiRef.current?.().catch(() => undefined);
+      notify('Saved Wi-Fi credentials cleared.', 'success');
       return;
     }
     if (status.status === 'failed') {
@@ -183,10 +216,17 @@ export function WifiProvisioning({
     if (
       status.status === 'invalid' ||
       status.status === 'busy' ||
-      status.status === 'scan_failed'
+      status.status === 'scan_failed' ||
+      status.status === 'clear_failed' ||
+      status.status === 'error'
     ) {
       setWifiScanning(false);
       setProvisioning(false);
+      setForgettingWifi(false);
+      if (forgetWifiTimer.current) {
+        clearTimeout(forgetWifiTimer.current);
+        forgetWifiTimer.current = null;
+      }
       const message =
         status.message ?? 'DrainGuard rejected the setup request.';
       setStatusMessage(message);
@@ -283,6 +323,36 @@ export function WifiProvisioning({
     } catch (error) {
       provisioningActive.current = false;
       setProvisioning(false);
+      const message = errorMessage(error);
+      setStatusMessage(message);
+      notify(message, 'danger');
+    }
+  };
+
+  const forgetWifi = async () => {
+    setForgettingWifi(true);
+    setStatusMessage('Clearing saved Wi-Fi credentials…');
+    if (forgetWifiTimer.current) {
+      clearTimeout(forgetWifiTimer.current);
+    }
+    forgetWifiTimer.current = setTimeout(() => {
+      setForgettingWifi(false);
+      setStatusMessage(
+        'DrainGuard did not confirm that the saved Wi-Fi was cleared.',
+      );
+      notify(
+        'Forget Wi-Fi timed out. Reconnect by Bluetooth and retry.',
+        'danger',
+      );
+    }, FORGET_WIFI_TIMEOUT_MS);
+    try {
+      await bleProvisioning.forgetWifi();
+    } catch (error) {
+      if (forgetWifiTimer.current) {
+        clearTimeout(forgetWifiTimer.current);
+        forgetWifiTimer.current = null;
+      }
+      setForgettingWifi(false);
       const message = errorMessage(error);
       setStatusMessage(message);
       notify(message, 'danger');
@@ -449,6 +519,18 @@ export function WifiProvisioning({
           OPEN PHONE BLUETOOTH SETTINGS
         </Text>
       </Pressable>
+
+      {onForgetWifi && selectedDevice ? (
+        <Pressable
+          accessibilityRole="button"
+          disabled={forgettingWifi || provisioning || wifiScanning}
+          onPress={forgetWifi}
+          style={styles.settingsLink}>
+          <Text style={[styles.settingsLinkText, styles.forgetText]}>
+            {forgettingWifi ? 'FORGETTING…' : 'FORGET SAVED WI-FI'}
+          </Text>
+        </Pressable>
+      ) : null}
     </Card>
   );
 }
@@ -603,5 +685,8 @@ const styles = StyleSheet.create({
     fontSize: 9,
     fontWeight: '700',
     letterSpacing: 0.6,
+  },
+  forgetText: {
+    color: colors.danger,
   },
 });

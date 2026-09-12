@@ -61,9 +61,13 @@ export class DrainGuardApi {
     this.baseUrl = getBaseUrl(deviceAddress);
   }
 
-  private async request<T>(path: string, method: 'GET' | 'POST' = 'GET') {
+  private async request<T>(
+    path: string,
+    method: 'GET' | 'POST' = 'GET',
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  ) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
@@ -95,7 +99,9 @@ export class DrainGuardApi {
   }
 
   controlArm(action: 'open' | 'close') {
-    return this.request(`/api/arm/${action}`, 'POST');
+    // The firmware sends its response after the smooth multi-servo sequence,
+    // which can legitimately take more than the normal six-second timeout.
+    return this.request(`/api/arm/${action}`, 'POST', 15000);
   }
 
   controlServo(servo: keyof ServoPositions, position: number) {
@@ -106,13 +112,19 @@ export class DrainGuardApi {
   }
 
   async getCameraStreamUrl() {
-    const result = await this.request<{stream_url?: string}>(
-      '/api/camera/stream',
-    );
+    const result = await this.request<{
+      stream_url?: string;
+      available?: boolean;
+    }>('/api/camera/stream');
+
+    // No ESP32-CAM connected — return empty string, camera screen handles it
+    if (result.available === false || !result.stream_url) {
+      return '';
+    }
 
     const streamUrl = result.stream_url?.trim();
     if (!streamUrl || !/^https?:\/\/[^\s]+$/i.test(streamUrl)) {
-      throw new Error('The camera stream URL is unavailable.');
+      return '';
     }
 
     return streamUrl;
