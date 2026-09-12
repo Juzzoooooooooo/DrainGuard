@@ -9,6 +9,22 @@
 #define API_ENDPOINT "http://your-server.com/api/telemetry"
 #define DEVICE_ID "DRAIN_GUARD_001"
 
+// BLE WiFi Provisioning
+#define WIFI_PROVISIONING_TIMEOUT_MS 30000
+#define BLE_PROVISIONING_STAY_ACTIVE true
+
+// Private robot hotspot. The ESP32 DevKit keeps this access point active so
+// the mobile app and ESP32-CAM can communicate without an external router.
+// WPA2 passwords must contain at least 8 characters.
+#define DRAINGUARD_AP_SSID "DrainGuard-Robot"
+#define DRAINGUARD_AP_PASSWORD "DrainGuard123"
+#define DRAINGUARD_AP_CHANNEL 1
+#define DRAINGUARD_AP_MAX_CLIENTS 4
+
+// ESP32-CAM address on the private robot hotspot.
+#define CAMERA_IP_ADDRESS "192.168.4.50"
+#define CAMERA_HTTP_PORT 80
+
 // Alert Configuration
 #define ALERT_PHONE_NUMBER "+1234567890"
 #define AUTO_OPEN_DRAIN true
@@ -42,8 +58,8 @@
 #define PCA9685_SCL 22
 #define PCA9685_ADDRESS 0x40
 
-// ESP32-CAM Communication (separate WiFi module)
-// Uses same I2C bus if needed
+// ESP32-CAM is a separate WiFi module; no DevKit GPIO connection is required.
+// These legacy optional I2C definitions remain reserved for compatibility.
 #define CAM_SDA 21
 #define CAM_SCL 22
 

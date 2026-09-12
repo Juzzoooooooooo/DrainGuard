@@ -71,15 +71,14 @@ public:
     pwm.setPWMFreq(SERVO_FREQ);
     
     delay(100);
-    
-    // Set to home position
-    pwm.setPWM(SERVO_BASE, 0, basePos);
-    pwm.setPWM(SERVO_SHOULDER, 0, shoulderPos);
-    pwm.setPWM(SERVO_ELBOW, 0, elbowPos);
-    pwm.setPWM(SERVO_GRIPPER, 0, gripperPos);
+
+    // Do not command any servo channel during startup. The arm stays where it
+    // is until an explicit app/API command (or an app-enabled auto mode) moves
+    // it. The position values above are only used as the initial software
+    // reference for the first commanded movement.
     
     initialized = true;
-    Serial.println("PCA9685 Servo controller initialized");
+    Serial.println("PCA9685 Servo controller initialized; startup movement disabled");
     
     return true;
   }

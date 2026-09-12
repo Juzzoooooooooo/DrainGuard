@@ -1,0 +1,37 @@
+# Local Android build toolchain and temporary React Native scaffold
+.build-tools/
+.native-template/
+
+# Build artifacts and caches
+.build/
+.tmp/
+.platformio/
+.venv-platformio/
+firmware/.pio/
+
+# Android build outputs (APK committed separately if needed)
+mobile-app/android/build/
+mobile-app/android/app/build/
+mobile-app/android/.gradle/
+mobile-app/.gradle/
+
+# Node modules
+mobile-app/node_modules/
+
+# iOS
+mobile-app/ios/Pods/
+mobile-app/ios/build/
+
+# Gradle wrapper
+mobile-app/android/gradlew.bat
+
+# Environment & secrets
+*.env
+*.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip

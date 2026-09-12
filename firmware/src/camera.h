@@ -2,11 +2,12 @@
 #define CAMERA_H
 
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <WiFi.h>
 #include "config.h"
 
 // Note: ESP32-CAM runs as a separate module with its own firmware
-// This class communicates with it via WiFi or serial
+// and communicates over the private DrainGuard WiFi hotspot.
 
 class CameraModule {
 private:
@@ -16,8 +17,8 @@ private:
   
 public:
   CameraModule() {
-    cameraIP = "192.168.4.1"; // Default AP mode IP
-    cameraPort = 80;
+    cameraIP = CAMERA_IP_ADDRESS;
+    cameraPort = CAMERA_HTTP_PORT;
     connected = false;
   }
   
@@ -40,7 +41,7 @@ public:
     http.setTimeout(2000);
     
     int httpCode = http.GET();
-    connected = (httpCode > 0);
+    connected = (httpCode == HTTP_CODE_OK);
     
     if (connected) {
       Serial.println("ESP32-CAM connected");

@@ -11,6 +11,7 @@
 #include "camera.h"
 #include "servo.h"
 #include "auto_mode.h"
+#include "wifi_provisioning.h"
 
 WebServer server(80);
 SensorManager sensors;
@@ -20,6 +21,8 @@ SMSModule smsModule;
 CameraModule camera;
 ServoController servoArm;
 AutoModeController autoMode;
+WiFiProvisioningManager provisioning;
+bool httpServerStarted = false;
 
 // System state
 struct SystemState {
@@ -35,20 +38,20 @@ struct SystemState {
 const float CRITICAL_LEVEL = 20.0; // cm
 const float WARNING_LEVEL = 50.0;  // cm
 
+void setupAPIEndpoints();
+void updateSystemState();
+void checkAlerts();
+void sendTelemetry();
+void checkAutoMode();
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Drain Guard System Starting...");
   
-  // Initialize WiFi
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  // Start BLE provisioning and connect using saved credentials.
+  // This is non-blocking, so invalid WiFi credentials never prevent the robot
+  // hardware or provisioning service from starting.
+  provisioning.begin(WIFI_SSID, WIFI_PASSWORD, API_ENDPOINT);
   
   // Initialize components
   sensors.begin();
@@ -60,9 +63,11 @@ void setup() {
   
   // Setup API endpoints
   setupAPIEndpoints();
-  
+  // The private hotspot is available even when the optional station uplink is
+  // not connected, so the local robot API must start unconditionally.
   server.begin();
-  Serial.println("HTTP server started");
+  httpServerStarted = true;
+  Serial.printf("HTTP server ready on hotspot: http://%s\n", provisioning.getHotspotIP().c_str());
   
   // Initialize state
   state.drainOpen = false;
@@ -71,7 +76,11 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
+  provisioning.update();
+
+  if (httpServerStarted) {
+    server.handleClient();
+  }
   
   // Update sensor readings every 2 seconds
   if (millis() - state.lastUpdate > 2000) {
@@ -94,29 +103,75 @@ void loop() {
   delay(10);
 }
 
+// Auto mode uses a state machine to avoid blocking the main loop
+// with long delay() calls that would freeze the web server and BLE
+enum AutoSequenceStep {
+  AUTO_IDLE,
+  AUTO_OPENING,
+  AUTO_WAITING,
+  AUTO_CLOSING,
+  AUTO_HOMING,
+  AUTO_COOLDOWN
+};
+
+AutoSequenceStep autoStep = AUTO_IDLE;
+unsigned long autoStepTime = 0;
+
 void checkAutoMode() {
-  if (autoMode.shouldOperate(state.distance)) {
-    autoMode.startOperation();
-    
-    Serial.println("Auto mode: Running automatic sequence");
-    
-    // Open drain
-    servoArm.openDrainWithArm();
-    delay(3000);
-    
-    // Wait
-    delay(2000);
-    
-    // Close drain
-    servoArm.closeDrainWithArm();
-    delay(3000);
-    
-    // Return home
-    servoArm.moveToHomePosition();
-    delay(2000);
-    
-    autoMode.completeOperation();
-    Serial.println("Auto mode: Sequence finished");
+  // State machine - no blocking delays
+  unsigned long now = millis();
+
+  switch (autoStep) {
+    case AUTO_IDLE:
+      if (autoMode.shouldOperate(state.distance)) {
+        autoMode.startOperation();
+        Serial.println("Auto mode: Opening drain");
+        servoArm.openDrainWithArm();
+        autoStep = AUTO_OPENING;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_OPENING:
+      if (now - autoStepTime >= 3000) {
+        Serial.println("Auto mode: Waiting");
+        autoStep = AUTO_WAITING;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_WAITING:
+      if (now - autoStepTime >= 2000) {
+        Serial.println("Auto mode: Closing drain");
+        servoArm.closeDrainWithArm();
+        autoStep = AUTO_CLOSING;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_CLOSING:
+      if (now - autoStepTime >= 3000) {
+        Serial.println("Auto mode: Returning home");
+        servoArm.moveToHomePosition();
+        autoStep = AUTO_HOMING;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_HOMING:
+      if (now - autoStepTime >= 2000) {
+        autoMode.completeOperation();
+        Serial.println("Auto mode: Sequence finished");
+        autoStep = AUTO_COOLDOWN;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_COOLDOWN:
+      if (now - autoStepTime >= 5000) {
+        autoStep = AUTO_IDLE;
+      }
+      break;
   }
 }
 
@@ -130,6 +185,11 @@ void updateSystemState() {
 }
 
 void checkAlerts() {
+  // Guard against invalid sensor readings (-1 means timeout/out-of-range)
+  if (state.distance <= 0) {
+    return;
+  }
+  
   if (state.distance < CRITICAL_LEVEL && !state.alertSent) {
     String alertMsg = "CRITICAL: Water level high at drain! ";
     alertMsg += "Location: " + String(state.gpsData.latitude, 6) + ", " 
@@ -151,8 +211,9 @@ void checkAlerts() {
 void sendTelemetry() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(API_ENDPOINT);
+    http.begin(provisioning.getApiEndpoint());
     http.addHeader("Content-Type", "application/json");
+    http.setTimeout(3000); // 3 second timeout - prevent blocking loop
     
     StaticJsonDocument<512> doc;
     doc["device_id"] = DEVICE_ID;
@@ -170,6 +231,8 @@ void sendTelemetry() {
     int httpCode = http.POST(jsonData);
     if (httpCode > 0) {
       Serial.printf("Telemetry sent: %d\n", httpCode);
+    } else {
+      Serial.printf("Telemetry failed: %s\n", http.errorToString(httpCode).c_str());
     }
     http.end();
   }

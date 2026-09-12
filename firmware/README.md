@@ -40,6 +40,28 @@ Install these libraries via Arduino Library Manager or PlatformIO:
 
 ## Configuration
 
+### Bluetooth WiFi provisioning (recommended)
+
+The firmware advertises a BLE setup service as `DrainGuard-XXXX`. Use the mobile app's **WiFi Setup** screen to scan for the robot, send WiFi credentials, optionally configure the telemetry endpoint, and receive live connection status. Successful credentials are persisted in ESP32 NVS and reused after restart.
+
+Provisioning uses a non-blocking 30-second WiFi attempt. If it fails, the robot continues operating and BLE remains available for another attempt. See [`docs/bluetooth-provisioning.md`](../docs/bluetooth-provisioning.md) for the protocol, native mobile permissions, security model, and complete setup instructions.
+
+### Private robot hotspot and camera
+
+The DevKit keeps a private WPA2 hotspot active independently of the optional BLE-provisioned internet connection:
+
+| Device | Network role | Address |
+|---|---|---|
+| ESP32 DevKit V1 | Hotspot and robot API | `192.168.4.1` |
+| ESP32-CAM | Hotspot client and video server | `192.168.4.50` |
+| Mobile phone | Hotspot client | Assigned automatically |
+
+The default hotspot is `DrainGuard-Robot` with password `DrainGuard123`. Change `DRAINGUARD_AP_SSID` and `DRAINGUARD_AP_PASSWORD` in `src/config.h` before deployment, then make the identical change in `esp32cam/esp32cam.ino`. The password must contain at least eight characters.
+
+This uses `WIFI_AP_STA`, so local control and video continue working without a router while the station interface can still use BLE-provisioned WiFi for telemetry. The ESP32-CAM communicates entirely over WiFi; there are no GPIO data wires between the two ESP32 boards.
+
+### Compile-time fallback
+
 1. Edit `src/config.h`:
 
 ```cpp
@@ -52,6 +74,10 @@ Install these libraries via Arduino Library Manager or PlatformIO:
 
 // API endpoint (optional cloud backend)
 #define API_ENDPOINT "http://your-server.com/api/telemetry"
+
+// Private robot hotspot
+#define DRAINGUARD_AP_SSID "DrainGuard-Robot"
+#define DRAINGUARD_AP_PASSWORD "replace-with-a-private-password"
 ```
 
 2. Adjust pin assignments if needed (see wiring diagram)
@@ -80,20 +106,31 @@ See `docs/wiring-diagram.md` for complete wiring details.
 
 ## ESP32-CAM Firmware
 
-The ESP32-CAM runs separate firmware for video streaming:
+The ESP32-CAM runs separate firmware for video streaming and joins the DevKit hotspot at `192.168.4.50`:
 
 1. Open `firmware/esp32cam/esp32cam.ino` in Arduino IDE
-2. Select board: ESP32 Wrover Module
-3. Connect ESP32-CAM via FTDI adapter:
+2. Confirm that `ssid` and `password` match the hotspot values in `src/config.h`
+3. Select board: **AI Thinker ESP32-CAM**
+4. Connect ESP32-CAM via FTDI adapter:
    - FTDI TX → ESP32-CAM RX
    - FTDI RX → ESP32-CAM TX
    - GND → GND
    - 5V → 5V
    - IO0 → GND (for programming mode)
-4. Upload firmware
-5. Remove IO0 to GND connection
-6. Reset ESP32-CAM
-7. Check serial monitor for IP address
+5. Upload firmware
+6. Remove IO0 to GND connection
+7. Reset ESP32-CAM
+8. Check the 115200-baud serial monitor for `192.168.4.50`
+
+Upload and power the DevKit firmware first so its hotspot is available when the camera starts.
+
+### Local mobile connection
+
+1. Power the ESP32 DevKit and wait for `DrainGuard hotspot ready` in Serial Monitor.
+2. Power the ESP32-CAM and wait for it to connect at `192.168.4.50`.
+3. Connect the phone to the `DrainGuard-Robot` WiFi network. A “no internet” notice is expected in local-only mode.
+4. In the app's **Settings**, set **Device IP address** to `192.168.4.1`.
+5. Test `http://192.168.4.50/capture` in the phone browser, then open **Live Camera** in the app.
 
 ## API Endpoints
 
@@ -110,14 +147,16 @@ Once running, the ESP32 exposes these REST endpoints:
 ### 1. Serial Monitor Test
 ```
 Drain Guard System Starting...
-Connecting to WiFi...
-WiFi connected!
-IP Address: 192.168.1.100
+BLE provisioning active as DrainGuard-1A2B
+DrainGuard hotspot ready: DrainGuard-Robot at http://192.168.4.1
+ESP32-CAM expected at http://192.168.4.50:80
+Loaded WiFi configuration for SSID: MyHotspot
 Ultrasonic sensor initialized
 Motor controller initialized
 A9G GPS module initialized
 A7670 SMS module initialized
-HTTP server started
+WiFi connected. IP address: 192.168.1.100
+HTTP server ready on hotspot: http://192.168.4.1
 ```
 
 ### 2. Ultrasonic Sensor Test
@@ -144,7 +183,8 @@ HTTP server started
 ## Troubleshooting
 
 ### WiFi Won't Connect
-- Check SSID and password in config.h
+- Open **WiFi Setup** in the mobile app and retry provisioning
+- Check the saved SSID and password, or the compile-time fallback in config.h
 - Ensure 2.4GHz WiFi (ESP32 doesn't support 5GHz)
 - Check WiFi signal strength
 
@@ -173,8 +213,11 @@ HTTP server started
 
 ### ESP32-CAM Not Streaming
 - Verify separate ESP32-CAM is powered and programmed
-- Check WiFi connection on ESP32-CAM
-- Access stream at: http://[ESP32-CAM-IP]/stream
+- Confirm its hotspot credentials exactly match the DevKit configuration
+- Connect the phone to `DrainGuard-Robot`
+- Test the snapshot at `http://192.168.4.50/capture`
+- Test the stream at `http://192.168.4.50/stream`
+- Confirm the app's Device IP is `192.168.4.1`
 - Ensure adequate 5V power (brown-out common issue)
 
 ## Power Consumption
