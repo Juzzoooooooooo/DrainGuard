@@ -1,5 +1,5 @@
 // DrainGuard Robot - Single File Version for Arduino IDE
-// ESP32-CAM is NOT required. Camera tab in web app will show "not available".
+// ESP32-CAM is optional. Controls remain available when the camera is offline.
 
 // ============================================================================
 // INCLUDES
@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <HardwareSerial.h>
@@ -40,6 +41,11 @@
 #define AP_SSID     "DrainGuard-Robot"
 #define AP_PASSWORD "DrainGuard123"
 #define AP_IP       "192.168.4.1"
+
+// Optional ESP32-CAM on the private hotspot
+#define CAMERA_IP   "192.168.4.50"
+#define CAMERA_PORT 80
+#define CAMERA_CHECK_TIMEOUT_MS 1500
 
 // Alert SMS number
 #define ALERT_PHONE "+1234567890"
@@ -140,6 +146,31 @@ struct SystemState {
   unsigned long lastSensorUpdate = 0;
 } state;
 
+// Servo positions mirror the controller's last commanded values.
+uint16_t basePos     = 330;
+uint16_t shoulderPos = 150;
+uint16_t elbowPos    = 300;
+uint16_t gripperPos  = 410;
+
+// Automatic arm sequence. It is disabled until explicitly enabled through
+// POST /api/auto/start.
+enum AutoSequenceStep {
+  AUTO_IDLE,
+  AUTO_OPENING,
+  AUTO_WAITING,
+  AUTO_CLOSING,
+  AUTO_HOMING,
+  AUTO_COOLDOWN
+};
+
+AutoSequenceStep autoStep = AUTO_IDLE;
+bool          autoModeEnabled   = false;
+bool          autoModeOperating = false;
+float         autoDetectionRange = CRITICAL_DIST;
+unsigned long autoStepTime       = 0;
+unsigned long autoLastOperation  = 0;
+const unsigned long AUTO_OPERATION_COOLDOWN_MS = 10000;
+
 // ============================================================================
 // BLE PROVISIONING STATE
 // ============================================================================
@@ -198,7 +229,14 @@ float readUltrasonic();
 void  openDrain();
 void  closeDrain();
 void  stopMotors();
+uint16_t getServoPosition(uint8_t ch);
 void  setServo(uint8_t ch, uint16_t pos);
+void  setServoSmooth(uint8_t ch, uint16_t pos, int stepDelayMs = 10);
+void  moveArmHome();
+void  openDrainWithArm();
+void  closeDrainWithArm();
+void  updateAutoMode();
+bool  checkCameraConnection();
 void  sendSMS(const String &number, const String &msg);
 void  checkAlerts();
 void  updateGPS();
@@ -626,6 +664,8 @@ void loop() {
     checkAlerts();
     state.lastSensorUpdate = millis();
   }
+
+  updateAutoMode();
 }
 
 // ============================================================================
@@ -684,8 +724,147 @@ void stopMotors() {
 // SERVO FUNCTIONS
 // ============================================================================
 
+uint16_t getServoPosition(uint8_t ch) {
+  switch (ch) {
+    case SERVO_BASE:     return basePos;
+    case SERVO_SHOULDER: return shoulderPos;
+    case SERVO_ELBOW:    return elbowPos;
+    case SERVO_GRIPPER:  return gripperPos;
+    default:             return 0;
+  }
+}
+
 void setServo(uint8_t ch, uint16_t pos) {
   pwm.setPWM(ch, 0, pos);
+  switch (ch) {
+    case SERVO_BASE:     basePos = pos; break;
+    case SERVO_SHOULDER: shoulderPos = pos; break;
+    case SERVO_ELBOW:    elbowPos = pos; break;
+    case SERVO_GRIPPER:  gripperPos = pos; break;
+  }
+}
+
+void setServoSmooth(uint8_t ch, uint16_t target, int stepDelayMs) {
+  int current = getServoPosition(ch);
+  int destination = target;
+  int direction = destination >= current ? 1 : -1;
+
+  for (int pos = current; pos != destination; pos += direction) {
+    setServo(ch, static_cast<uint16_t>(pos));
+    delay(stepDelayMs);
+  }
+  setServo(ch, target);
+}
+
+void moveArmHome() {
+  Serial.println("[Arm] Returning home");
+  setServoSmooth(SERVO_BASE, 330);
+  delay(100);
+  setServoSmooth(SERVO_SHOULDER, 150);
+  delay(100);
+  setServoSmooth(SERVO_ELBOW, 300);
+  delay(100);
+  setServoSmooth(SERVO_GRIPPER, 410);
+}
+
+void openDrainWithArm() {
+  Serial.println("[Arm] Opening drain");
+  setServoSmooth(SERVO_BASE, 250);
+  delay(500);
+  setServoSmooth(SERVO_SHOULDER, 380);
+  delay(500);
+  setServoSmooth(SERVO_ELBOW, 380);
+  delay(500);
+  setServoSmooth(SERVO_GRIPPER, 510);
+  delay(1000);
+  state.drainOpen = true;
+}
+
+void closeDrainWithArm() {
+  Serial.println("[Arm] Closing drain");
+  setServoSmooth(SERVO_GRIPPER, 410);
+  delay(500);
+  setServoSmooth(SERVO_ELBOW, 300);
+  delay(500);
+  setServoSmooth(SERVO_SHOULDER, 150);
+  delay(500);
+  setServoSmooth(SERVO_BASE, 330);
+  delay(500);
+  state.drainOpen = false;
+}
+
+void updateAutoMode() {
+  if (!autoModeEnabled) {
+    autoModeOperating = false;
+    autoStep = AUTO_IDLE;
+    return;
+  }
+
+  unsigned long now = millis();
+  switch (autoStep) {
+    case AUTO_IDLE:
+      // readUltrasonic() returns -1 for a timeout or out-of-range reading.
+      // Reject all non-positive values before comparing with the threshold.
+      if (
+        state.distance > 0 &&
+        state.distance <= autoDetectionRange &&
+        now - autoLastOperation >= AUTO_OPERATION_COOLDOWN_MS
+      ) {
+        autoModeOperating = true;
+        autoLastOperation = now;
+        openDrainWithArm();
+        autoStep = AUTO_OPENING;
+        autoStepTime = millis();
+      }
+      break;
+
+    case AUTO_OPENING:
+      if (now - autoStepTime >= 3000) {
+        autoStep = AUTO_WAITING;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_WAITING:
+      if (now - autoStepTime >= 2000) {
+        closeDrainWithArm();
+        autoStep = AUTO_CLOSING;
+        autoStepTime = millis();
+      }
+      break;
+
+    case AUTO_CLOSING:
+      if (now - autoStepTime >= 3000) {
+        moveArmHome();
+        autoStep = AUTO_HOMING;
+        autoStepTime = millis();
+      }
+      break;
+
+    case AUTO_HOMING:
+      if (now - autoStepTime >= 2000) {
+        autoModeOperating = false;
+        autoStep = AUTO_COOLDOWN;
+        autoStepTime = now;
+      }
+      break;
+
+    case AUTO_COOLDOWN:
+      if (now - autoStepTime >= 5000) {
+        autoStep = AUTO_IDLE;
+      }
+      break;
+  }
+}
+
+bool checkCameraConnection() {
+  HTTPClient http;
+  String statusUrl = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/status";
+  http.begin(statusUrl);
+  http.setTimeout(CAMERA_CHECK_TIMEOUT_MS);
+  int httpCode = http.GET();
+  http.end();
+  return httpCode == HTTP_CODE_OK;
 }
 
 // ============================================================================
@@ -903,12 +1082,31 @@ void setupAPIEndpoints() {
     server.send(200, "application/json", "{\"status\":\"closed\"}");
   });
 
+  // Robotic arm actions used by the mobile camera controls.
+  server.on("/api/arm/open", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    openDrainWithArm();
+    server.send(200, "application/json", "{\"status\":\"opened\",\"method\":\"servo_arm\"}");
+  });
+
+  server.on("/api/arm/close", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    closeDrainWithArm();
+    server.send(200, "application/json", "{\"status\":\"closed\",\"method\":\"servo_arm\"}");
+  });
+
+  server.on("/api/arm/home", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    moveArmHome();
+    server.send(200, "application/json", "{\"status\":\"home\"}");
+  });
+
   // POST /api/servo/base?position=330
   server.on("/api/servo/base", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_BASE_MIN, SERVO_BASE_MAX);
-    setServo(SERVO_BASE, pos);
+    setServoSmooth(SERVO_BASE, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -917,7 +1115,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
-    setServo(SERVO_SHOULDER, pos);
+    setServoSmooth(SERVO_SHOULDER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -926,7 +1124,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
-    setServo(SERVO_ELBOW, pos);
+    setServoSmooth(SERVO_ELBOW, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -935,15 +1133,79 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
-    setServo(SERVO_GRIPPER, pos);
+    setServoSmooth(SERVO_GRIPPER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
-  // GET /api/camera/stream — no camera, return not_available
+  server.on("/api/servo/status", HTTP_GET, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    StaticJsonDocument<192> doc;
+    doc["base"] = basePos;
+    doc["shoulder"] = shoulderPos;
+    doc["elbow"] = elbowPos;
+    doc["gripper"] = gripperPos;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/auto/start", HTTP_POST, []() {
+    autoModeEnabled = true;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"status\":\"started\"}");
+  });
+
+  server.on("/api/auto/stop", HTTP_POST, []() {
+    autoModeEnabled = false;
+    autoModeOperating = false;
+    autoStep = AUTO_IDLE;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"status\":\"stopped\"}");
+  });
+
+  server.on("/api/auto/status", HTTP_GET, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    StaticJsonDocument<160> doc;
+    doc["enabled"] = autoModeEnabled;
+    doc["operating"] = autoModeOperating;
+    doc["detection_range"] = autoDetectionRange;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/auto/range", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (!server.hasArg("range")) {
+      server.send(400, "application/json", "{\"error\":\"missing range parameter\"}");
+      return;
+    }
+
+    float range = server.arg("range").toFloat();
+    if (range <= 0 || range > MAX_DISTANCE) {
+      server.send(400, "application/json", "{\"error\":\"range must be between 0 and 400 cm\"}");
+      return;
+    }
+
+    autoDetectionRange = range;
+    server.send(200, "application/json", "{\"status\":\"updated\"}");
+  });
+
+  // Return the ESP32-CAM stream when reachable. If it is offline, the app
+  // displays its placeholder while keeping all arm controls available.
   server.on("/api/camera/stream", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(200, "application/json",
-      "{\"available\":false,\"message\":\"ESP32-CAM not connected\"}");
+    bool available = checkCameraConnection();
+    StaticJsonDocument<192> doc;
+    doc["available"] = available;
+    if (available) {
+      doc["stream_url"] = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/stream";
+    } else {
+      doc["stream_url"] = "";
+    }
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
   });
 
   // GET /api/gps

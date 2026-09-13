@@ -30,7 +30,7 @@ private:
   }
   
 public:
-  SMSModule() : smsSerial(1) {}
+  SMSModule() : smsSerial(2) {}
   
   void begin() {
     pinMode(A7670_POWER, OUTPUT);

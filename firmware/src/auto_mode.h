@@ -53,6 +53,7 @@ public:
   bool shouldOperate(float currentDistance) {
     if (!enabled) return false;
     if (isOperating) return false;
+    if (currentDistance <= 0) return false;
     
     // Check cooldown period
     if (millis() - lastOperation < operationCooldown) {
