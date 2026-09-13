@@ -46,6 +46,8 @@
 #define CAMERA_IP   "192.168.4.50"
 #define CAMERA_PORT 80
 #define CAMERA_CHECK_TIMEOUT_MS 1500
+// How often to probe the ESP32-CAM in the background (ms)
+#define CAMERA_CHECK_INTERVAL_MS 10000
 
 // Alert SMS number
 #define ALERT_PHONE "+1234567890"
@@ -236,7 +238,7 @@ void  moveArmHome();
 void  openDrainWithArm();
 void  closeDrainWithArm();
 void  updateAutoMode();
-bool  checkCameraConnection();
+void  updateCameraStatus();
 void  sendSMS(const String &number, const String &msg);
 void  checkAlerts();
 void  updateGPS();
@@ -666,6 +668,7 @@ void loop() {
   }
 
   updateAutoMode();
+  updateCameraStatus();
 }
 
 // ============================================================================
@@ -857,14 +860,24 @@ void updateAutoMode() {
   }
 }
 
-bool checkCameraConnection() {
+// ── Camera availability cache (updated in background, never in a handler) ──
+bool          cameraAvailable       = false;
+unsigned long cameraLastCheck       = 0;
+
+// Called from loop() — probes ESP32-CAM in the background every 10 seconds.
+// Never call this from inside a server.on() handler or it will block the loop.
+void updateCameraStatus() {
+  if (millis() - cameraLastCheck < CAMERA_CHECK_INTERVAL_MS) return;
+  cameraLastCheck = millis();
+
   HTTPClient http;
-  String statusUrl = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/status";
-  http.begin(statusUrl);
+  String url = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/status";
+  http.begin(url);
   http.setTimeout(CAMERA_CHECK_TIMEOUT_MS);
-  int httpCode = http.GET();
+  int code = http.GET();
   http.end();
-  return httpCode == HTTP_CODE_OK;
+  cameraAvailable = (code == HTTP_CODE_OK);
+  Serial.printf("[CAM] Probe %s\n", cameraAvailable ? "OK" : "offline");
 }
 
 // ============================================================================
@@ -1191,14 +1204,14 @@ void setupAPIEndpoints() {
     server.send(200, "application/json", "{\"status\":\"updated\"}");
   });
 
-  // Return the ESP32-CAM stream when reachable. If it is offline, the app
-  // displays its placeholder while keeping all arm controls available.
+  // Return the ESP32-CAM stream URL from the cached availability value.
+  // The camera is probed in the background by updateCameraStatus() in loop(),
+  // so this handler returns immediately without blocking.
   server.on("/api/camera/stream", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    bool available = checkCameraConnection();
     StaticJsonDocument<192> doc;
-    doc["available"] = available;
-    if (available) {
+    doc["available"] = cameraAvailable;
+    if (cameraAvailable) {
       doc["stream_url"] = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/stream";
     } else {
       doc["stream_url"] = "";
