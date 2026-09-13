@@ -233,6 +233,7 @@ void  closeDrain();
 void  stopMotors();
 uint16_t getServoPosition(uint8_t ch);
 void  setServo(uint8_t ch, uint16_t pos);
+void  setServoImmediate(uint8_t ch, uint16_t pos);
 void  setServoSmooth(uint8_t ch, uint16_t pos, int stepDelayMs = 10);
 void  moveArmHome();
 void  openDrainWithArm();
@@ -747,12 +748,19 @@ void setServo(uint8_t ch, uint16_t pos) {
   }
 }
 
+// Direct move — no delay, used for joystick/manual control from the app.
+// The app controls speed by how fast it sends commands.
+void setServoImmediate(uint8_t ch, uint16_t pos) {
+  setServo(ch, pos);
+}
+
+// Smooth move — used only for pre-programmed arm sequences (open/close drain).
+// This BLOCKS loop() while running — call from arm action endpoints only,
+// not from any code that needs the server to stay responsive.
 void setServoSmooth(uint8_t ch, uint16_t target, int stepDelayMs) {
   int current = getServoPosition(ch);
-  int destination = target;
-  int direction = destination >= current ? 1 : -1;
-
-  for (int pos = current; pos != destination; pos += direction) {
+  int direction = target >= (uint16_t)current ? 1 : -1;
+  for (int pos = current; pos != (int)target; pos += direction) {
     setServo(ch, static_cast<uint16_t>(pos));
     delay(stepDelayMs);
   }
@@ -1119,7 +1127,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_BASE_MIN, SERVO_BASE_MAX);
-    setServoSmooth(SERVO_BASE, pos);
+    setServoImmediate(SERVO_BASE, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -1128,7 +1136,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
-    setServoSmooth(SERVO_SHOULDER, pos);
+    setServoImmediate(SERVO_SHOULDER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -1137,7 +1145,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
-    setServoSmooth(SERVO_ELBOW, pos);
+    setServoImmediate(SERVO_ELBOW, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
@@ -1146,7 +1154,7 @@ void setupAPIEndpoints() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
     int pos = constrain(server.arg("position").toInt(), SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
-    setServoSmooth(SERVO_GRIPPER, pos);
+    setServoImmediate(SERVO_GRIPPER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
