@@ -1072,7 +1072,7 @@ void setupAPIEndpoints() {
   // GET /api/status
   server.on("/api/status", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    StaticJsonDocument<320> doc;
+    StaticJsonDocument<384> doc;
     doc["device_id"]        = DEVICE_ID;
     doc["water_level"]      = state.waterLevel;
     doc["distance"]         = state.distance;
@@ -1080,11 +1080,16 @@ void setupAPIEndpoints() {
     doc["wifi_connected"]   = (WiFi.status() == WL_CONNECTED);
     doc["wifi_ip"]          = (WiFi.status() == WL_CONNECTED)
                               ? WiFi.localIP().toString() : "";
-    doc["camera_available"] = false;
+    doc["camera_available"] = cameraAvailable;
     doc["latitude"]         = gpsLat;
     doc["longitude"]        = gpsLon;
     doc["satellites"]       = gpsSatCount;
     doc["gps_valid"]        = gpsValid;
+    // Health diagnostics — visible from app without USB cable
+    doc["uptime_s"]         = (unsigned long)(millis() / 1000);
+    doc["free_heap"]        = (int)ESP.getFreeHeap();
+    doc["reset_reason"]     = (int)esp_reset_reason();
+    doc["brownout"]         = (esp_reset_reason() == ESP_RST_BROWNOUT);
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
