@@ -48,6 +48,8 @@ function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
+  // Track consecutive failures — only show disconnected after 2 in a row
+  const failCount = React.useRef(0);
   const [ready, setReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -117,9 +119,15 @@ function App() {
       const nextStatus = await api.getSystemStatus();
       setStatus(nextStatus);
       setConnected(true);
+      failCount.current = 0;
       return true;
     } catch {
-      setConnected(false);
+      failCount.current += 1;
+      // Only mark as disconnected after 2 consecutive failures.
+      // This prevents a single slow response from flipping the indicator.
+      if (failCount.current >= 2) {
+        setConnected(false);
+      }
       return false;
     }
   }, [api]);
@@ -135,10 +143,12 @@ function App() {
   }, [notify, refreshStatus]);
 
   useEffect(() => {
-    if (!ready || activeTab !== 'dashboard') {
+    if (!ready) {
       return;
     }
 
+    // Start polling immediately and keep it running across tab switches.
+    // Switching tabs no longer resets the interval.
     refreshStatus();
     const interval = setInterval(
       refreshStatus,
@@ -146,16 +156,18 @@ function App() {
     );
 
     return () => clearInterval(interval);
-  }, [activeTab, ready, refreshStatus, settings.refreshRate]);
+  }, [ready, refreshStatus, settings.refreshRate]);
 
   const controlArm = useCallback(
     async (action: 'open' | 'close') => {
       try {
         await api.controlArm(action);
         setConnected(true);
+        failCount.current = 0;
         notify(`Arm ${action} command sent.`, 'success');
       } catch (error) {
-        setConnected(false);
+        // Don't flip connection state on arm command failure — arm sequences
+        // take up to 15s and a timeout doesn't mean the device is offline.
         notify(`Failed to run the arm ${action} action.`, 'danger');
         throw error;
       }
@@ -168,22 +180,27 @@ function App() {
       try {
         await api.controlServo(servo, position);
         setConnected(true);
+        failCount.current = 0;
       } catch (error) {
-        setConnected(false);
-        notify('Arm control lost connection to the device.', 'danger');
+        // Silently ignore individual servo failures — joystick sends many
+        // commands rapidly and occasional drops are expected on WiFi.
         throw error;
       }
     },
-    [api, notify],
+    [api],
   );
 
   const loadStreamUrl = useCallback(async () => {
     try {
       const url = await api.getCameraStreamUrl();
       setConnected(true);
+      failCount.current = 0;
       return url;
     } catch (error) {
-      setConnected(false);
+      failCount.current += 1;
+      if (failCount.current >= 2) {
+        setConnected(false);
+      }
       throw error;
     }
   }, [api]);
