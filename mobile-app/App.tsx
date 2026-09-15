@@ -16,6 +16,7 @@ import {CameraScreen} from './src/screens/CameraScreen';
 import {DashboardScreen} from './src/screens/DashboardScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {DrainGuardApi} from './src/services/api';
+import {bleController} from './src/services/bleController';
 import {
   loadSettings as loadSavedSettings,
   saveSettings as persistSettings,
@@ -48,13 +49,11 @@ function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
-  // Track consecutive failures — only show disconnected after 2 in a row
-  const failCount = React.useRef(0);
   const [ready, setReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
 
-  const api = useMemo(
+  const cameraApi = useMemo(
     () => new DrainGuardApi(settings.deviceIp),
     [settings.deviceIp],
   );
@@ -89,6 +88,50 @@ function App() {
   }, [notify]);
 
   useEffect(() => {
+    let mounted = true;
+    const subscription = bleController.onConnectionState(state => {
+      if (!mounted) {
+        return;
+      }
+      if (state === 'connected') {
+        setConnected(true);
+      } else if (state === 'disconnected' || state === 'error') {
+        setConnected(false);
+      } else if (
+        state === 'connecting' ||
+        state === 'reconnecting' ||
+        state === 'pairing' ||
+        state === 'discovering'
+      ) {
+        setConnected(null);
+      }
+    });
+
+    bleController
+      .isConnected()
+      .then(isConnected => {
+        if (!mounted) {
+          return;
+        }
+        if (isConnected) {
+          setConnected(true);
+          return;
+        }
+        return bleController.reconnectLast();
+      })
+      .catch(() => {
+        if (mounted) {
+          setConnected(false);
+        }
+      });
+
+    return () => {
+      mounted = false;
+      subscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     screenMode?.setCameraMode?.(cameraMode);
 
     return () => {
@@ -116,21 +159,14 @@ function App() {
 
   const refreshStatus = useCallback(async () => {
     try {
-      const nextStatus = await api.getSystemStatus();
+      const nextStatus = await bleController.getSystemStatus();
       setStatus(nextStatus);
       setConnected(true);
-      failCount.current = 0;
       return true;
     } catch {
-      failCount.current += 1;
-      // Only mark as disconnected after 2 consecutive failures.
-      // This prevents a single slow response from flipping the indicator.
-      if (failCount.current >= 2) {
-        setConnected(false);
-      }
       return false;
     }
-  }, [api]);
+  }, []);
 
   const manualRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -138,7 +174,7 @@ function App() {
     setRefreshing(false);
 
     if (!succeeded) {
-      notify('Could not reach the Drain Guard controller.', 'danger');
+      notify('Connect the DrainGuard controller by Bluetooth.', 'danger');
     }
   }, [notify, refreshStatus]);
 
@@ -161,9 +197,8 @@ function App() {
   const controlArm = useCallback(
     async (action: 'open' | 'close') => {
       try {
-        await api.controlArm(action);
+        await bleController.controlArm(action);
         setConnected(true);
-        failCount.current = 0;
         notify(`Arm ${action} command sent.`, 'success');
       } catch (error) {
         // Don't flip connection state on arm command failure — arm sequences
@@ -172,45 +207,36 @@ function App() {
         throw error;
       }
     },
-    [api, notify],
+    [notify],
   );
 
   const controlServo = useCallback(
     async (servo: keyof ServoPositions, position: number) => {
       try {
-        await api.controlServo(servo, position);
+        await bleController.controlServo(servo, position);
         setConnected(true);
-        failCount.current = 0;
       } catch (error) {
-        // Silently ignore individual servo failures — joystick sends many
-        // commands rapidly and occasional drops are expected on WiFi.
+        // Joystick sends many commands rapidly; the next BLE command can
+        // recover without changing the controller connection indicator.
         throw error;
       }
     },
-    [api],
+    [],
   );
 
   const loadStreamUrl = useCallback(async () => {
     try {
-      const url = await api.getCameraStreamUrl();
-      setConnected(true);
-      failCount.current = 0;
-      return url;
+      return await cameraApi.getCameraStreamUrl();
     } catch (error) {
-      failCount.current += 1;
-      if (failCount.current >= 2) {
-        setConnected(false);
-      }
       throw error;
     }
-  }, [api]);
+  }, [cameraApi]);
 
   const updateSettings = useCallback(
     async (nextSettings: AppSettings) => {
       try {
         await persistSettings(nextSettings);
         setSettings(nextSettings);
-        setConnected(null);
         notify('Settings saved successfully.', 'success');
       } catch {
         notify('Settings could not be saved.', 'danger');
@@ -224,7 +250,6 @@ function App() {
       const nextSettings = {...settings, deviceIp};
       await persistSettings(nextSettings);
       setSettings(nextSettings);
-      setConnected(null);
     },
     [settings],
   );
@@ -236,7 +261,6 @@ function App() {
     };
     await persistSettings(nextSettings);
     setSettings(nextSettings);
-    setConnected(null);
   }, [settings]);
 
   const toastView = toast ? (

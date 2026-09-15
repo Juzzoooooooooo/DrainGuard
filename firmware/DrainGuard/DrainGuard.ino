@@ -182,6 +182,30 @@ BLECharacteristic *bleTx         = nullptr;
 bool               bleConnected  = false;
 bool               bleAdvRestart = false;
 unsigned long      bleDisconnAt  = 0;
+String             bleReceiveBuffer;
+
+enum BleControllerCommandType : uint8_t {
+  BLE_CONTROLLER_GET_STATUS,
+  BLE_CONTROLLER_ARM_OPEN,
+  BLE_CONTROLLER_ARM_CLOSE,
+  BLE_CONTROLLER_SERVO,
+};
+
+enum BleControllerServo : uint8_t {
+  BLE_CONTROLLER_SERVO_BASE,
+  BLE_CONTROLLER_SERVO_SHOULDER,
+  BLE_CONTROLLER_SERVO_ELBOW,
+  BLE_CONTROLLER_SERVO_GRIPPER,
+};
+
+struct BleControllerCommand {
+  BleControllerCommandType type;
+  BleControllerServo servo;
+  uint32_t requestId;
+  uint16_t position;
+};
+
+QueueHandle_t bleControllerQueue = nullptr;
 
 // Non-blocking WiFi state machine
 enum WifiConnState { WCS_IDLE, WCS_CONNECTING, WCS_CONNECTED, WCS_FAILED };
@@ -218,7 +242,11 @@ String        smsNumber;
 
 void  initHotspot();
 void  initBLE();
+void  handleBleChunk(const String &chunk);
 void  handleBleWrite(const String &json);
+void  processBleControllerCommand();
+void  notifyBleControllerStatus(uint32_t requestId);
+void  notifyBleControllerResult(uint32_t requestId, bool ok, const String &message = "");
 void  startWifiConnection(const String &ssid, const String &pass, bool save);
 void  updateWifiState();
 void  updateWifiScan();
@@ -278,7 +306,7 @@ class BleWriteCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *ch) override {
     String raw = String(ch->getValue().c_str());
     ch->setValue("");
-    if (raw.length() > 0) handleBleWrite(raw);
+    if (raw.length() > 0) handleBleChunk(raw);
   }
 };
 
@@ -290,6 +318,9 @@ class BleWriteCB : public BLECharacteristicCallbacks {
 //   {"command":"scan_wifi"}
 //   {"command":"set_wifi","ssid":"MyNet","password":"secret"}
 //   {"command":"forget_wifi"}
+//   {"command":"get_status","id":1}
+//   {"command":"arm","action":"open","id":2}
+//   {"command":"servo","servo":"base","position":330,"id":3}
 //
 // Responses ESP32 notifies back (TX characteristic):
 //   {"status":"ready","device":"DrainGuard-XXXX","hotspot_ip":"192.168.4.1"}
@@ -301,6 +332,29 @@ class BleWriteCB : public BLECharacteristicCallbacks {
 //   {"status":"failed","reason":"authentication_failed"}
 //   {"status":"forgotten","configured":false,"hotspot_ip":"192.168.4.1"}
 
+void handleBleChunk(const String &chunk) {
+  if (chunk == "RESET" || chunk == "RESET\n") {
+    bleReceiveBuffer = "";
+    return;
+  }
+
+  bleReceiveBuffer += chunk;
+  if (bleReceiveBuffer.length() > 768) {
+    bleReceiveBuffer = "";
+    bleNotify("{\"status\":\"invalid\",\"message\":\"BLE command is too large\"}");
+    return;
+  }
+
+  int delimiterIndex = bleReceiveBuffer.indexOf('\n');
+  while (delimiterIndex >= 0) {
+    String payload = bleReceiveBuffer.substring(0, delimiterIndex);
+    bleReceiveBuffer.remove(0, delimiterIndex + 1);
+    payload.trim();
+    if (payload.length() > 0) handleBleWrite(payload);
+    delimiterIndex = bleReceiveBuffer.indexOf('\n');
+  }
+}
+
 void handleBleWrite(const String &json) {
   Serial.printf("[BLE] Received: %s\n", json.c_str());
 
@@ -311,6 +365,68 @@ void handleBleWrite(const String &json) {
   }
 
   const char *cmd = doc["command"] | "";
+
+  if (
+    strcmp(cmd, "get_status") == 0 ||
+    strcmp(cmd, "arm") == 0 ||
+    strcmp(cmd, "servo") == 0
+  ) {
+    BleControllerCommand command = {};
+    command.requestId = doc["id"] | 0;
+    if (command.requestId == 0) {
+      bleNotify("{\"status\":\"invalid\",\"message\":\"Controller request id is required\"}");
+      return;
+    }
+
+    if (strcmp(cmd, "get_status") == 0) {
+      command.type = BLE_CONTROLLER_GET_STATUS;
+    } else if (strcmp(cmd, "arm") == 0) {
+      const char *action = doc["action"] | "";
+      if (strcmp(action, "open") == 0) {
+        command.type = BLE_CONTROLLER_ARM_OPEN;
+      } else if (strcmp(action, "close") == 0) {
+        command.type = BLE_CONTROLLER_ARM_CLOSE;
+      } else {
+        notifyBleControllerResult(command.requestId, false, "Unsupported arm action");
+        return;
+      }
+    } else {
+      const char *servoName = doc["servo"] | "";
+      if (!doc["position"].is<int>()) {
+        notifyBleControllerResult(command.requestId, false, "Servo position is required");
+        return;
+      }
+
+      int position = doc["position"].as<int>();
+      if (position < 0 || position > 4095) {
+        notifyBleControllerResult(command.requestId, false, "Servo position is invalid");
+        return;
+      }
+
+      command.type = BLE_CONTROLLER_SERVO;
+      command.position = static_cast<uint16_t>(position);
+      if (strcmp(servoName, "base") == 0) {
+        command.servo = BLE_CONTROLLER_SERVO_BASE;
+      } else if (strcmp(servoName, "shoulder") == 0) {
+        command.servo = BLE_CONTROLLER_SERVO_SHOULDER;
+      } else if (strcmp(servoName, "elbow") == 0) {
+        command.servo = BLE_CONTROLLER_SERVO_ELBOW;
+      } else if (strcmp(servoName, "gripper") == 0) {
+        command.servo = BLE_CONTROLLER_SERVO_GRIPPER;
+      } else {
+        notifyBleControllerResult(command.requestId, false, "Unsupported servo");
+        return;
+      }
+    }
+
+    if (
+      bleControllerQueue == nullptr ||
+      xQueueSend(bleControllerQueue, &command, 0) != pdTRUE
+    ) {
+      notifyBleControllerResult(command.requestId, false, "Controller command queue is busy");
+    }
+    return;
+  }
 
   // scan_wifi — return list of visible 2.4 GHz networks
   if (strcmp(cmd, "scan_wifi") == 0) {
@@ -371,6 +487,87 @@ void handleBleWrite(const String &json) {
       return;
     }
     startWifiConnection(String(ssid), String(pass), true);
+    return;
+  }
+
+  // get_status — return current sensor readings via BLE
+  if (strcmp(cmd, "get_status") == 0) {
+    long reqId = doc["id"] | 0;
+    StaticJsonDocument<320> resp;
+    resp["status"] = "controller_status";   // must match app's parseControllerStatus
+    resp["id"]     = reqId;
+    resp["wl"]     = state.waterLevel;
+    resp["d"]      = state.distance;
+    resp["o"]      = state.drainOpen;
+    resp["lat"]    = gpsLat;
+    resp["lon"]    = gpsLon;
+    resp["sat"]    = gpsSatCount;
+    String out; serializeJson(resp, out);
+    bleNotify(out);
+    return;
+  }
+
+  // arm — open or close drain with robotic arm
+  if (strcmp(cmd, "arm") == 0) {
+    const char *action = doc["action"] | "";
+    long reqId = doc["id"] | 0;
+    if (strcmp(action, "open") == 0) {
+      openDrainWithArm();
+    } else if (strcmp(action, "close") == 0) {
+      closeDrainWithArm();
+    } else {
+      StaticJsonDocument<96> resp;
+      resp["status"] = "command_result"; resp["id"] = reqId;
+      resp["ok"] = false; resp["message"] = "arm action must be open or close";
+      String out; serializeJson(resp, out);
+      bleNotify(out);
+      return;
+    }
+    StaticJsonDocument<64> resp;
+    resp["status"] = "command_result"; resp["id"] = reqId; resp["ok"] = true;
+    String out; serializeJson(resp, out);
+    bleNotify(out);
+    return;
+  }
+
+  // servo — move individual servo
+  if (strcmp(cmd, "servo") == 0) {
+    const char *servoName = doc["servo"] | "";
+    int position  = doc["position"] | -1;
+    long reqId    = doc["id"] | 0;
+
+    if (position < 0) {
+      StaticJsonDocument<96> resp;
+      resp["status"] = "command_result"; resp["id"] = reqId;
+      resp["ok"] = false; resp["message"] = "missing servo position";
+      String out; serializeJson(resp, out);
+      bleNotify(out);
+      return;
+    }
+
+    uint8_t ch = 255;
+    int minPos = 0, maxPos = 4095;
+    if      (strcmp(servoName, "base")     == 0) { ch = SERVO_BASE;     minPos = SERVO_BASE_MIN;     maxPos = SERVO_BASE_MAX; }
+    else if (strcmp(servoName, "shoulder") == 0) { ch = SERVO_SHOULDER; minPos = SERVO_SHOULDER_MIN; maxPos = SERVO_SHOULDER_MAX; }
+    else if (strcmp(servoName, "elbow")    == 0) { ch = SERVO_ELBOW;    minPos = SERVO_ELBOW_MIN;    maxPos = SERVO_ELBOW_MAX; }
+    else if (strcmp(servoName, "gripper")  == 0) { ch = SERVO_GRIPPER;  minPos = SERVO_GRIPPER_MIN;  maxPos = SERVO_GRIPPER_MAX; }
+
+    if (ch == 255) {
+      StaticJsonDocument<96> resp;
+      resp["status"] = "command_result"; resp["id"] = reqId;
+      resp["ok"] = false; resp["message"] = "unknown servo name";
+      String out; serializeJson(resp, out);
+      bleNotify(out);
+      return;
+    }
+
+    position = constrain(position, minPos, maxPos);
+    setServoImmediate(ch, (uint16_t)position);
+
+    StaticJsonDocument<64> resp;
+    resp["status"] = "command_result"; resp["id"] = reqId; resp["ok"] = true;
+    String out; serializeJson(resp, out);
+    bleNotify(out);
     return;
   }
 
@@ -487,8 +684,98 @@ void restartBleAdv() {
 
 void bleNotify(const String &json) {
   if (bleTx == nullptr) return;
-  bleTx->setValue(json.c_str());
-  if (bleConnected) bleTx->notify();
+  if (!bleConnected) {
+    bleTx->setValue(json.c_str());
+    return;
+  }
+
+  String framed = json + "\n";
+  constexpr size_t chunkSize = 20;
+  for (size_t offset = 0; offset < framed.length(); offset += chunkSize) {
+    String chunk = framed.substring(offset, min(offset + chunkSize, framed.length()));
+    bleTx->setValue(chunk.c_str());
+    bleTx->notify();
+    delay(15);
+  }
+}
+
+void notifyBleControllerStatus(uint32_t requestId) {
+  StaticJsonDocument<256> doc;
+  doc["status"] = "controller_status";
+  doc["id"] = requestId;
+  doc["wl"] = state.waterLevel;
+  doc["d"] = state.distance;
+  doc["o"] = state.drainOpen;
+  doc["lat"] = gpsLat;
+  doc["lon"] = gpsLon;
+  doc["sat"] = gpsSatCount;
+  String out;
+  serializeJson(doc, out);
+  bleNotify(out);
+}
+
+void notifyBleControllerResult(uint32_t requestId, bool ok, const String &message) {
+  StaticJsonDocument<160> doc;
+  doc["status"] = "command_result";
+  doc["id"] = requestId;
+  doc["ok"] = ok;
+  if (message.length() > 0) doc["message"] = message;
+  String out;
+  serializeJson(doc, out);
+  bleNotify(out);
+}
+
+void processBleControllerCommand() {
+  if (bleControllerQueue == nullptr) return;
+
+  BleControllerCommand command;
+  if (xQueueReceive(bleControllerQueue, &command, 0) != pdTRUE) return;
+
+  switch (command.type) {
+    case BLE_CONTROLLER_GET_STATUS:
+      notifyBleControllerStatus(command.requestId);
+      break;
+
+    case BLE_CONTROLLER_ARM_OPEN:
+      notifyBleControllerResult(command.requestId, true, "accepted");
+      openDrainWithArm();
+      break;
+
+    case BLE_CONTROLLER_ARM_CLOSE:
+      notifyBleControllerResult(command.requestId, true, "accepted");
+      closeDrainWithArm();
+      break;
+
+    case BLE_CONTROLLER_SERVO:
+      switch (command.servo) {
+        case BLE_CONTROLLER_SERVO_BASE:
+          setServoImmediate(
+            SERVO_BASE,
+            constrain(command.position, SERVO_BASE_MIN, SERVO_BASE_MAX)
+          );
+          break;
+        case BLE_CONTROLLER_SERVO_SHOULDER:
+          setServoImmediate(
+            SERVO_SHOULDER,
+            constrain(command.position, SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX)
+          );
+          break;
+        case BLE_CONTROLLER_SERVO_ELBOW:
+          setServoImmediate(
+            SERVO_ELBOW,
+            constrain(command.position, SERVO_ELBOW_MIN, SERVO_ELBOW_MAX)
+          );
+          break;
+        case BLE_CONTROLLER_SERVO_GRIPPER:
+          setServoImmediate(
+            SERVO_GRIPPER,
+            constrain(command.position, SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX)
+          );
+          break;
+      }
+      notifyBleControllerResult(command.requestId, true, "moved");
+      break;
+  }
 }
 
 // ============================================================================
@@ -618,6 +905,11 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
 
+  bleControllerQueue = xQueueCreate(8, sizeof(BleControllerCommand));
+  if (bleControllerQueue == nullptr) {
+    Serial.println("[BLE] Failed to create controller command queue");
+  }
+
   initHotspot();
   initBLE();
 
@@ -645,6 +937,7 @@ void loop() {
   updateWifiState();
   updateWifiScan();
   restartBleAdv();
+  processBleControllerCommand();
 
   // LED status indicator
   updateLED();
