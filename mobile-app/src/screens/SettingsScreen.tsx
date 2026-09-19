@@ -149,28 +149,27 @@ export function SettingsScreen({
             }}
           />
 
-          <Card icon="⌁" title="Device Configuration">
+          <Card icon="⌁" title="Camera Network">
             <View style={styles.networkNote}>
               <Text style={styles.networkIcon}>⌁</Text>
               <View style={styles.networkCopy}>
-                <Text style={styles.networkTitle}>
-                  Local controller address
-                </Text>
+                <Text style={styles.networkTitle}>Optional camera gateway</Text>
                 <Text style={styles.networkText}>
-                  Bluetooth Wi-Fi setup connects DrainGuard to the internet.
-                  This address is still used for direct local control.
+                  Controls use the WiFi hotspot (192.168.4.1). This address is
+                  only needed to discover the ESP32-CAM stream if it runs on a
+                  different IP.
                 </Text>
               </View>
             </View>
 
             <Field
               hint="Default hotspot controller: 192.168.4.1"
-              label="Device IP address"
+              label="Camera gateway IP address"
               onChangeText={setDeviceIp}
               value={deviceIp}
             />
             <Field
-              hint="How often the dashboard requests fresh sensor data."
+              hint="How often the dashboard polls the device status over WiFi."
               keyboardType="number-pad"
               label="Auto refresh rate (seconds)"
               onChangeText={setRefreshRate}

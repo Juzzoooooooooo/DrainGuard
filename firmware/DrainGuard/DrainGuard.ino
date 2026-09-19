@@ -1,5 +1,5 @@
-// DrainGuard Robot - Single File Version for Arduino IDE
-// ESP32-CAM is optional. Controls remain available when the camera is offline.
+// DrainGuard Robot - HOTSPOT-ONLY VERSION (NO BLUETOOTH)
+// Phone connects to ESP32 WiFi hotspot → controls via HTTP API
 
 // ============================================================================
 // INCLUDES
@@ -7,54 +7,35 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <HardwareSerial.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-// Fallback WiFi — only used if no credentials saved in NVS.
-// Use BLE provisioning from your phone to set the real network.
-#define DEFAULT_WIFI_SSID     ""
-#define DEFAULT_WIFI_PASSWORD ""
-
 #define DEVICE_ID "DRAIN_GUARD_001"
 
-// BLE provisioning — unique name uses last 4 hex digits of chip ID
-#define BLE_DEVICE_PREFIX "DrainGuard"
-
-// BLE service / characteristic UUIDs
-#define PROV_SERVICE_UUID "7b0d1001-5f6b-4c4f-9a7e-2f3b4d5e6f70"
-#define PROV_RX_UUID      "7b0d1002-5f6b-4c4f-9a7e-2f3b4d5e6f70"  // phone → ESP32
-#define PROV_TX_UUID      "7b0d1003-5f6b-4c4f-9a7e-2f3b4d5e6f70"  // ESP32 → phone
-
-// Private hotspot — always on, web app connects here
+// WiFi Hotspot — phone connects here
 #define AP_SSID     "DrainGuard-Robot"
 #define AP_PASSWORD "DrainGuard123"
 #define AP_IP       "192.168.4.1"
 
-// Optional ESP32-CAM on the private hotspot
-#define CAMERA_IP   "192.168.4.50"
-#define CAMERA_PORT 80
+// Optional ESP32-CAM on the hotspot network
+#define CAMERA_IP               "192.168.4.50"
+#define CAMERA_PORT             80
 #define CAMERA_CHECK_TIMEOUT_MS 1500
-// How often to probe the ESP32-CAM in the background (ms)
 #define CAMERA_CHECK_INTERVAL_MS 10000
 
 // Alert SMS number
-#define ALERT_PHONE "+1234567890"
+#define ALERT_PHONE    "+1234567890"
 #define AUTO_OPEN_DRAIN true
-
-// WiFi connection timeout
-#define WIFI_CONNECT_TIMEOUT_MS 20000
 
 // ── Pin Definitions ──────────────────────────────────────────────────────────
 
@@ -69,43 +50,41 @@
 #define MOTOR_PWMB  13
 #define MOTOR_STBY   4
 
-#define A9G_RX      33   // GPS Serial1
+#define A9G_RX      33
 #define A9G_TX      32
 
-#define A7670_RX    16   // SMS Serial2
+#define A7670_RX    16
 #define A7670_TX    17
 
-#define PCA9685_SDA 21
-#define PCA9685_SCL 22
+#define PCA9685_SDA  21
+#define PCA9685_SCL  22
 #define PCA9685_ADDR 0x40
 
-// LED indicators — GPIO 2 is the built-in blue LED on ESP32 DevKit V1
-#define LED_BUILTIN_PIN  2
+#define LED_BUILTIN_PIN 2
 
-// ── System timing ─────────────────────────────────────────────────────────────
+// ── Timing ───────────────────────────────────────────────────────────────────
 
-#define SENSOR_INTERVAL  2000   // ms between ultrasonic reads
-
-// ── Motor timing ─────────────────────────────────────────────────────────────
-
-#define MOTOR_SPEED     200     // 0-255
-#define DRAIN_OPEN_MS  5000
-#define DRAIN_CLOSE_MS 5000
+#define SENSOR_INTERVAL  2000
+#define MOTOR_SPEED      200
+#define MOTOR_WIFI_SPEED 100  // low power mode — safe for shared power supply
+#define DRAIN_OPEN_MS   5000
+#define DRAIN_CLOSE_MS  5000
 
 // ── Ultrasonic ───────────────────────────────────────────────────────────────
 
-#define MAX_DISTANCE 400        // cm
-#define TANK_HEIGHT  200        // cm
+#define MAX_DISTANCE 400
+#define TANK_HEIGHT  200
 
-// ── Servo channels on PCA9685 ────────────────────────────────────────────────
+// ── Servo channels (PCA9685) ─────────────────────────────────────────────────
 
 #define SERVO_FREQ         60
-#define SERVO_BASE          0
-#define SERVO_SHOULDER      1
-#define SERVO_ELBOW         2
-#define SERVO_GRIPPER       3
+#define SERVO_BASE          0   // servo1 — base rotation
+#define SERVO_SHOULDER      1   // servo2 — shoulder
+#define SERVO_ELBOW         2   // servo3 — elbow
+#define SERVO_GRIPPER       3   // servo4 — gripper
 
-#define SERVO_BASE_MIN     150
+// Exact values from reference Robot_arm.ino — tested and working
+#define SERVO_BASE_MIN     250
 #define SERVO_BASE_MAX     450
 #define SERVO_SHOULDER_MIN 150
 #define SERVO_SHOULDER_MAX 380
@@ -114,122 +93,72 @@
 #define SERVO_GRIPPER_MIN  410
 #define SERVO_GRIPPER_MAX  510
 
-// ── Alert thresholds (sensor distance in cm) ─────────────────────────────────
+// ── Alert thresholds ─────────────────────────────────────────────────────────
 
 #define CRITICAL_DIST 20.0f
 #define WARNING_DIST  50.0f
-
-// ── NVS keys ─────────────────────────────────────────────────────────────────
-
-#define NVS_NAMESPACE "drainguard"
-#define NVS_KEY_SSID  "ssid"
-#define NVS_KEY_PASS  "password"
-#define NVS_KEY_SAVED "configured"
 
 // ============================================================================
 // GLOBAL OBJECTS
 // ============================================================================
 
 WebServer               server(80);
+WebSocketsServer        wsServer(81);   // WebSocket on port 81
 Adafruit_PWMServoDriver pwm(PCA9685_ADDR);
-HardwareSerial          gpsSerial(1);   // Serial1 — A9G GPS
-HardwareSerial          smsSerial(2);   // Serial2 — A7670 SMS
-Preferences             prefs;
+HardwareSerial          gpsSerial(1);
+HardwareSerial          smsSerial(2);
 
 // ============================================================================
 // STATE
 // ============================================================================
 
 struct SystemState {
-  float         distance        = -1;
-  float         waterLevel      =  0;
-  bool          drainOpen       = false;
-  bool          alertSent       = false;
-  unsigned long lastSensorUpdate = 0;
+  float         distance         = -1;
+  float         waterLevel       =  0;
+  bool          drainOpen        = false;
+  bool          alertSent        = false;
+  unsigned long lastSensorUpdate =  0;
 } state;
 
-// Servo positions mirror the controller's last commanded values.
-uint16_t basePos     = 330;
+uint16_t basePos     = 330;  // reference home position
 uint16_t shoulderPos = 150;
 uint16_t elbowPos    = 300;
 uint16_t gripperPos  = 410;
 
-// Automatic arm sequence. It is disabled until explicitly enabled through
-// POST /api/auto/start.
 enum AutoSequenceStep {
-  AUTO_IDLE,
-  AUTO_OPENING,
-  AUTO_WAITING,
-  AUTO_CLOSING,
-  AUTO_HOMING,
-  AUTO_COOLDOWN
+  AUTO_IDLE, AUTO_OPENING, AUTO_WAITING,
+  AUTO_CLOSING, AUTO_HOMING, AUTO_COOLDOWN
 };
 
-AutoSequenceStep autoStep = AUTO_IDLE;
-bool          autoModeEnabled   = false;
-bool          autoModeOperating = false;
-float         autoDetectionRange = CRITICAL_DIST;
-unsigned long autoStepTime       = 0;
-unsigned long autoLastOperation  = 0;
+AutoSequenceStep autoStep            = AUTO_IDLE;
+bool             autoModeEnabled     = false;
+bool             autoModeOperating   = false;
+float            autoDetectionRange  = CRITICAL_DIST;
+unsigned long    autoStepTime        = 0;
+unsigned long    autoLastOperation   = 0;
 const unsigned long AUTO_OPERATION_COOLDOWN_MS = 10000;
 
-// ============================================================================
-// BLE PROVISIONING STATE
-// ============================================================================
+unsigned long ledTimer = 0;
+bool          ledState = false;
 
-BLEServer         *bleServer     = nullptr;
-BLECharacteristic *bleTx         = nullptr;
-bool               bleConnected  = false;
-bool               bleAdvRestart = false;
-unsigned long      bleDisconnAt  = 0;
-String             bleReceiveBuffer;
+String gpsBuffer;
+float  gpsLat      = 0;
+float  gpsLon      = 0;
+int    gpsSatCount = 0;
+bool   gpsValid    = false;
 
-enum BleControllerCommandType : uint8_t {
-  BLE_CONTROLLER_GET_STATUS,
-  BLE_CONTROLLER_ARM_OPEN,
-  BLE_CONTROLLER_ARM_CLOSE,
-  BLE_CONTROLLER_SERVO,
-};
+struct CameraState {
+  bool available    = false;
+  bool streaming    = false;
+  int  quality      = 1;
+  int  brightness   = 0;
+  int  contrast     = 0;
+  bool flashEnabled = false;
+} cameraState;
 
-enum BleControllerServo : uint8_t {
-  BLE_CONTROLLER_SERVO_BASE,
-  BLE_CONTROLLER_SERVO_SHOULDER,
-  BLE_CONTROLLER_SERVO_ELBOW,
-  BLE_CONTROLLER_SERVO_GRIPPER,
-};
+bool          cameraAvailable = false;
+unsigned long cameraLastCheck = 0;
 
-struct BleControllerCommand {
-  BleControllerCommandType type;
-  BleControllerServo servo;
-  uint32_t requestId;
-  uint16_t position;
-};
-
-QueueHandle_t bleControllerQueue = nullptr;
-
-// Non-blocking WiFi state machine
-enum WifiConnState { WCS_IDLE, WCS_CONNECTING, WCS_CONNECTED, WCS_FAILED };
-WifiConnState wifiConnState   = WCS_IDLE;
-unsigned long wifiConnStartAt = 0;
-String        pendingSsid;
-String        pendingPass;
-bool          saveOnSuccess   = false;
-
-bool          wifiScanInProgress = false;
-String        deviceName;
-
-// ── LED state ─────────────────────────────────────────────────────────────
-unsigned long ledTimer    = 0;
-bool          ledState    = false;
-
-// ── GPS state (populated by updateGPS in loop) ────────────────────────────
-String  gpsBuffer;
-float   gpsLat      = 0;
-float   gpsLon      = 0;
-int     gpsSatCount = 0;
-bool    gpsValid    = false;
-
-// ── SMS state machine ─────────────────────────────────────────────────────
 enum SmsState { SMS_IDLE, SMS_CMGF, SMS_NUMBER, SMS_BODY, SMS_WAIT };
 SmsState      smsState  = SMS_IDLE;
 unsigned long smsTimer  = 0;
@@ -240,574 +169,32 @@ String        smsNumber;
 // FORWARD DECLARATIONS
 // ============================================================================
 
-void  initHotspot();
-void  initBLE();
-void  handleBleChunk(const String &chunk);
-void  handleBleWrite(const String &json);
-void  processBleControllerCommand();
-void  notifyBleControllerStatus(uint32_t requestId);
-void  notifyBleControllerResult(uint32_t requestId, bool ok, const String &message = "");
-void  startWifiConnection(const String &ssid, const String &pass, bool save);
-void  updateWifiState();
-void  updateWifiScan();
-void  restartBleAdv();
-void  bleNotify(const String &json);
-void  loadSavedCredentials(String &ssid, String &pass);
-bool  saveCredentials(const String &ssid, const String &pass);
-void  setupAPIEndpoints();
-float readUltrasonic();
-void  openDrain();
-void  closeDrain();
-void  stopMotors();
+void     initHotspot();
+void     setupAPIEndpoints();
+void     setupWebSocket();
+void     onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+float    readUltrasonic();
+void     openDrain();
+void     closeDrain();
+void     stopMotors();
 uint16_t getServoPosition(uint8_t ch);
-void  setServo(uint8_t ch, uint16_t pos);
-void  setServoImmediate(uint8_t ch, uint16_t pos);
-void  setServoSmooth(uint8_t ch, uint16_t pos, int stepDelayMs = 10);
-void  moveArmHome();
-void  openDrainWithArm();
-void  closeDrainWithArm();
-void  updateAutoMode();
-void  updateCameraStatus();
-void  sendSMS(const String &number, const String &msg);
-void  checkAlerts();
-void  updateGPS();
-void  updateSMS();
-void  parseGGA(const String &sentence);
-void  updateLED();
+void     setServo(uint8_t ch, uint16_t pos);
+void     setServoImmediate(uint8_t ch, uint16_t pos);
+void     servoSpin(uint8_t ch, uint16_t direction, uint32_t ms);
+void     moveArmHome();
+void     openDrainWithArm();
+void     closeDrainWithArm();
+void     updateAutoMode();
+void     updateCameraStatus();
+void     sendSMS(const String &number, const String &msg);
+void     checkAlerts();
+void     updateGPS();
+void     updateSMS();
+void     parseGGA(const String &sentence);
+void     updateLED();
 
 // ============================================================================
-// BLE CALLBACKS
-// ============================================================================
-
-class BleServerCB : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) override {
-    bleConnected  = true;
-    bleAdvRestart = false;
-    Serial.println("[BLE] Phone connected");
-
-    // Stop advertising while connected — reduces interference
-    BLEDevice::getAdvertising()->stop();
-
-    // DO NOT notify immediately here — Android needs a moment
-    // to complete service discovery before it can receive notifications.
-    // The mobile app should READ the TX characteristic after connecting
-    // to get the initial status.
-  }
-
-  void onDisconnect(BLEServer *pServer) override {
-    bleConnected  = false;
-    bleAdvRestart = true;
-    bleDisconnAt  = millis();
-    Serial.println("[BLE] Phone disconnected");
-  }
-};
-
-class BleWriteCB : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *ch) override {
-    String raw = String(ch->getValue().c_str());
-    ch->setValue("");
-    if (raw.length() > 0) handleBleChunk(raw);
-  }
-};
-
-// ============================================================================
-// BLE PROVISIONING LOGIC
-// ============================================================================
-
-// Commands phone sends (JSON written to RX characteristic):
-//   {"command":"scan_wifi"}
-//   {"command":"set_wifi","ssid":"MyNet","password":"secret"}
-//   {"command":"forget_wifi"}
-//   {"command":"get_status","id":1}
-//   {"command":"arm","action":"open","id":2}
-//   {"command":"servo","servo":"base","position":330,"id":3}
-//
-// Responses ESP32 notifies back (TX characteristic):
-//   {"status":"ready","device":"DrainGuard-XXXX","hotspot_ip":"192.168.4.1"}
-//   {"status":"scanning_wifi"}
-//   {"status":"network","ssid":"MyNet","rssi":-62,"secure":true}
-//   {"status":"scan_complete","count":5}
-//   {"status":"connecting","ssid":"MyNet"}
-//   {"status":"connected","ssid":"MyNet","ip":"192.168.1.55","saved":true}
-//   {"status":"failed","reason":"authentication_failed"}
-//   {"status":"forgotten","configured":false,"hotspot_ip":"192.168.4.1"}
-
-void handleBleChunk(const String &chunk) {
-  if (chunk == "RESET" || chunk == "RESET\n") {
-    bleReceiveBuffer = "";
-    return;
-  }
-
-  bleReceiveBuffer += chunk;
-  if (bleReceiveBuffer.length() > 768) {
-    bleReceiveBuffer = "";
-    bleNotify("{\"status\":\"invalid\",\"message\":\"BLE command is too large\"}");
-    return;
-  }
-
-  int delimiterIndex = bleReceiveBuffer.indexOf('\n');
-  while (delimiterIndex >= 0) {
-    String payload = bleReceiveBuffer.substring(0, delimiterIndex);
-    bleReceiveBuffer.remove(0, delimiterIndex + 1);
-    payload.trim();
-    if (payload.length() > 0) handleBleWrite(payload);
-    delimiterIndex = bleReceiveBuffer.indexOf('\n');
-  }
-}
-
-void handleBleWrite(const String &json) {
-  Serial.printf("[BLE] Received: %s\n", json.c_str());
-
-  StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, json) != DeserializationError::Ok) {
-    bleNotify("{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
-    return;
-  }
-
-  const char *cmd = doc["command"] | "";
-
-  if (
-    strcmp(cmd, "get_status") == 0 ||
-    strcmp(cmd, "arm") == 0 ||
-    strcmp(cmd, "servo") == 0
-  ) {
-    BleControllerCommand command = {};
-    command.requestId = doc["id"] | 0;
-    if (command.requestId == 0) {
-      bleNotify("{\"status\":\"invalid\",\"message\":\"Controller request id is required\"}");
-      return;
-    }
-
-    if (strcmp(cmd, "get_status") == 0) {
-      command.type = BLE_CONTROLLER_GET_STATUS;
-    } else if (strcmp(cmd, "arm") == 0) {
-      const char *action = doc["action"] | "";
-      if (strcmp(action, "open") == 0) {
-        command.type = BLE_CONTROLLER_ARM_OPEN;
-      } else if (strcmp(action, "close") == 0) {
-        command.type = BLE_CONTROLLER_ARM_CLOSE;
-      } else {
-        notifyBleControllerResult(command.requestId, false, "Unsupported arm action");
-        return;
-      }
-    } else {
-      const char *servoName = doc["servo"] | "";
-      if (!doc["position"].is<int>()) {
-        notifyBleControllerResult(command.requestId, false, "Servo position is required");
-        return;
-      }
-
-      int position = doc["position"].as<int>();
-      if (position < 0 || position > 4095) {
-        notifyBleControllerResult(command.requestId, false, "Servo position is invalid");
-        return;
-      }
-
-      command.type = BLE_CONTROLLER_SERVO;
-      command.position = static_cast<uint16_t>(position);
-      if (strcmp(servoName, "base") == 0) {
-        command.servo = BLE_CONTROLLER_SERVO_BASE;
-      } else if (strcmp(servoName, "shoulder") == 0) {
-        command.servo = BLE_CONTROLLER_SERVO_SHOULDER;
-      } else if (strcmp(servoName, "elbow") == 0) {
-        command.servo = BLE_CONTROLLER_SERVO_ELBOW;
-      } else if (strcmp(servoName, "gripper") == 0) {
-        command.servo = BLE_CONTROLLER_SERVO_GRIPPER;
-      } else {
-        notifyBleControllerResult(command.requestId, false, "Unsupported servo");
-        return;
-      }
-    }
-
-    if (
-      bleControllerQueue == nullptr ||
-      xQueueSend(bleControllerQueue, &command, 0) != pdTRUE
-    ) {
-      notifyBleControllerResult(command.requestId, false, "Controller command queue is busy");
-    }
-    return;
-  }
-
-  // scan_wifi — return list of visible 2.4 GHz networks
-  if (strcmp(cmd, "scan_wifi") == 0) {
-    if (wifiScanInProgress) {
-      bleNotify("{\"status\":\"scanning_wifi\",\"message\":\"Already scanning\"}");
-      return;
-    }
-    WiFi.mode(WIFI_AP_STA);
-    if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED) {
-      bleNotify("{\"status\":\"scan_failed\",\"message\":\"Could not start scan\"}");
-      return;
-    }
-    wifiScanInProgress = true;
-    bleNotify("{\"status\":\"scanning_wifi\"}");
-    return;
-  }
-
-  // forget_wifi - clear the saved uplink without stopping the robot hotspot
-  if (strcmp(cmd, "forget_wifi") == 0) {
-    if (wifiScanInProgress) {
-      WiFi.scanDelete();
-      wifiScanInProgress = false;
-    }
-    wifiConnState = WCS_IDLE;
-    saveOnSuccess = false;
-    pendingSsid = "";
-    pendingPass = "";
-    WiFi.setAutoReconnect(false);
-    WiFi.disconnect(false, true);
-    WiFi.mode(WIFI_AP_STA);
-
-    bool cleared = false;
-    if (prefs.begin(NVS_NAMESPACE, false)) {
-      cleared = prefs.clear();
-      prefs.end();
-    }
-    if (!cleared) {
-      bleNotify("{\"status\":\"clear_failed\",\"message\":\"Unable to clear saved WiFi credentials\"}");
-      return;
-    }
-
-    bleNotify("{\"status\":\"forgotten\",\"configured\":false,\"hotspot_ip\":\"" AP_IP "\"}");
-    Serial.println("[NVS] Saved WiFi credentials cleared; hotspot remains active");
-    return;
-  }
-
-  // set_wifi — connect ESP32 to the given network and save credentials
-  if (strcmp(cmd, "set_wifi") == 0) {
-    const char *ssid = doc["ssid"] | "";
-    const char *pass = doc["password"] | "";
-
-    if (strlen(ssid) == 0 || strlen(ssid) > 32) {
-      bleNotify("{\"status\":\"error\",\"message\":\"SSID must be 1-32 characters\"}");
-      return;
-    }
-    if (strlen(pass) > 63) {
-      bleNotify("{\"status\":\"error\",\"message\":\"Password too long (max 63)\"}");
-      return;
-    }
-    startWifiConnection(String(ssid), String(pass), true);
-    return;
-  }
-
-  // get_status — return current sensor readings via BLE
-  if (strcmp(cmd, "get_status") == 0) {
-    long reqId = doc["id"] | 0;
-    StaticJsonDocument<320> resp;
-    resp["status"] = "controller_status";   // must match app's parseControllerStatus
-    resp["id"]     = reqId;
-    resp["wl"]     = state.waterLevel;
-    resp["d"]      = state.distance;
-    resp["o"]      = state.drainOpen;
-    resp["lat"]    = gpsLat;
-    resp["lon"]    = gpsLon;
-    resp["sat"]    = gpsSatCount;
-    String out; serializeJson(resp, out);
-    bleNotify(out);
-    return;
-  }
-
-  // arm — open or close drain with robotic arm
-  if (strcmp(cmd, "arm") == 0) {
-    const char *action = doc["action"] | "";
-    long reqId = doc["id"] | 0;
-    if (strcmp(action, "open") == 0) {
-      openDrainWithArm();
-    } else if (strcmp(action, "close") == 0) {
-      closeDrainWithArm();
-    } else {
-      StaticJsonDocument<96> resp;
-      resp["status"] = "command_result"; resp["id"] = reqId;
-      resp["ok"] = false; resp["message"] = "arm action must be open or close";
-      String out; serializeJson(resp, out);
-      bleNotify(out);
-      return;
-    }
-    StaticJsonDocument<64> resp;
-    resp["status"] = "command_result"; resp["id"] = reqId; resp["ok"] = true;
-    String out; serializeJson(resp, out);
-    bleNotify(out);
-    return;
-  }
-
-  // servo — move individual servo
-  if (strcmp(cmd, "servo") == 0) {
-    const char *servoName = doc["servo"] | "";
-    int position  = doc["position"] | -1;
-    long reqId    = doc["id"] | 0;
-
-    if (position < 0) {
-      StaticJsonDocument<96> resp;
-      resp["status"] = "command_result"; resp["id"] = reqId;
-      resp["ok"] = false; resp["message"] = "missing servo position";
-      String out; serializeJson(resp, out);
-      bleNotify(out);
-      return;
-    }
-
-    uint8_t ch = 255;
-    int minPos = 0, maxPos = 4095;
-    if      (strcmp(servoName, "base")     == 0) { ch = SERVO_BASE;     minPos = SERVO_BASE_MIN;     maxPos = SERVO_BASE_MAX; }
-    else if (strcmp(servoName, "shoulder") == 0) { ch = SERVO_SHOULDER; minPos = SERVO_SHOULDER_MIN; maxPos = SERVO_SHOULDER_MAX; }
-    else if (strcmp(servoName, "elbow")    == 0) { ch = SERVO_ELBOW;    minPos = SERVO_ELBOW_MIN;    maxPos = SERVO_ELBOW_MAX; }
-    else if (strcmp(servoName, "gripper")  == 0) { ch = SERVO_GRIPPER;  minPos = SERVO_GRIPPER_MIN;  maxPos = SERVO_GRIPPER_MAX; }
-
-    if (ch == 255) {
-      StaticJsonDocument<96> resp;
-      resp["status"] = "command_result"; resp["id"] = reqId;
-      resp["ok"] = false; resp["message"] = "unknown servo name";
-      String out; serializeJson(resp, out);
-      bleNotify(out);
-      return;
-    }
-
-    position = constrain(position, minPos, maxPos);
-    setServoImmediate(ch, (uint16_t)position);
-
-    StaticJsonDocument<64> resp;
-    resp["status"] = "command_result"; resp["id"] = reqId; resp["ok"] = true;
-    String out; serializeJson(resp, out);
-    bleNotify(out);
-    return;
-  }
-
-  bleNotify("{\"status\":\"error\",\"message\":\"Unknown command\"}");
-}
-
-void startWifiConnection(const String &ssid, const String &pass, bool save) {
-  pendingSsid     = ssid;
-  pendingPass     = pass;
-  saveOnSuccess   = save;
-  wifiConnState   = WCS_CONNECTING;
-  wifiConnStartAt = millis();
-
-  WiFi.setAutoReconnect(true);
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_AP_STA);         // keep hotspot alive while connecting
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  StaticJsonDocument<128> doc;
-  doc["status"] = "connecting";
-  doc["ssid"]   = ssid;
-  String out; serializeJson(doc, out);
-  bleNotify(out);
-
-  Serial.printf("[WiFi] Connecting to: %s\n", ssid.c_str());
-}
-
-void updateWifiState() {
-  if (wifiConnState != WCS_CONNECTING) return;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnState = WCS_CONNECTED;
-    bool saved = false;
-    if (saveOnSuccess) saved = saveCredentials(pendingSsid, pendingPass);
-    pendingPass = "";
-
-    StaticJsonDocument<256> doc;
-    doc["status"] = "connected";
-    doc["ssid"]   = pendingSsid;
-    doc["ip"]     = WiFi.localIP().toString();
-    doc["hotspot_ip"] = AP_IP;
-    doc["saved"]  = saved;
-    String out; serializeJson(doc, out);
-    bleNotify(out);
-
-    Serial.printf("[WiFi] Connected! IP: %s  saved: %s\n",
-                  WiFi.localIP().toString().c_str(), saved ? "yes" : "no");
-    return;
-  }
-
-  if (millis() - wifiConnStartAt >= WIFI_CONNECT_TIMEOUT_MS) {
-    wl_status_t s = WiFi.status();
-    wifiConnState = WCS_FAILED;
-    pendingPass   = "";
-    WiFi.disconnect(false, false);
-
-    const char *reason = "timeout";
-    if      (s == WL_NO_SSID_AVAIL)  reason = "network_not_found";
-    else if (s == WL_CONNECT_FAILED)  reason = "authentication_failed";
-    else if (s == WL_CONNECTION_LOST) reason = "connection_lost";
-
-    StaticJsonDocument<192> doc;
-    doc["status"]  = "failed";
-    doc["reason"]  = reason;
-    doc["message"] = "Could not connect within 20 seconds";
-    String out; serializeJson(doc, out);
-    bleNotify(out);
-
-    Serial.printf("[WiFi] Failed: %s\n", reason);
-  }
-}
-
-void updateWifiScan() {
-  if (!wifiScanInProgress) return;
-
-  int n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_RUNNING) return;
-
-  if (n < 0) {
-    wifiScanInProgress = false;
-    bleNotify("{\"status\":\"scan_failed\"}");
-    return;
-  }
-
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i).length() == 0) continue;
-    StaticJsonDocument<192> doc;
-    doc["status"] = "network";
-    doc["ssid"]   = WiFi.SSID(i);
-    doc["rssi"]   = WiFi.RSSI(i);
-    doc["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-    String out; serializeJson(doc, out);
-    bleNotify(out);
-    delay(15);
-  }
-
-  WiFi.scanDelete();
-  wifiScanInProgress = false;
-
-  StaticJsonDocument<64> doc;
-  doc["status"] = "scan_complete";
-  doc["count"]  = n;
-  String out; serializeJson(doc, out);
-  bleNotify(out);
-}
-
-void restartBleAdv() {
-  if (!bleAdvRestart) return;
-  if (millis() - bleDisconnAt < 500) return;  // wait 500ms after disconnect
-  bleAdvRestart = false;
-  BLEDevice::startAdvertising();
-  Serial.println("[BLE] Advertising restarted");
-}
-
-void bleNotify(const String &json) {
-  if (bleTx == nullptr) return;
-  if (!bleConnected) {
-    bleTx->setValue(json.c_str());
-    return;
-  }
-
-  String framed = json + "\n";
-  constexpr size_t chunkSize = 20;
-  for (size_t offset = 0; offset < framed.length(); offset += chunkSize) {
-    String chunk = framed.substring(offset, min(offset + chunkSize, framed.length()));
-    bleTx->setValue(chunk.c_str());
-    bleTx->notify();
-    delay(15);
-  }
-}
-
-void notifyBleControllerStatus(uint32_t requestId) {
-  StaticJsonDocument<256> doc;
-  doc["status"] = "controller_status";
-  doc["id"] = requestId;
-  doc["wl"] = state.waterLevel;
-  doc["d"] = state.distance;
-  doc["o"] = state.drainOpen;
-  doc["lat"] = gpsLat;
-  doc["lon"] = gpsLon;
-  doc["sat"] = gpsSatCount;
-  String out;
-  serializeJson(doc, out);
-  bleNotify(out);
-}
-
-void notifyBleControllerResult(uint32_t requestId, bool ok, const String &message) {
-  StaticJsonDocument<160> doc;
-  doc["status"] = "command_result";
-  doc["id"] = requestId;
-  doc["ok"] = ok;
-  if (message.length() > 0) doc["message"] = message;
-  String out;
-  serializeJson(doc, out);
-  bleNotify(out);
-}
-
-void processBleControllerCommand() {
-  if (bleControllerQueue == nullptr) return;
-
-  BleControllerCommand command;
-  if (xQueueReceive(bleControllerQueue, &command, 0) != pdTRUE) return;
-
-  switch (command.type) {
-    case BLE_CONTROLLER_GET_STATUS:
-      notifyBleControllerStatus(command.requestId);
-      break;
-
-    case BLE_CONTROLLER_ARM_OPEN:
-      notifyBleControllerResult(command.requestId, true, "accepted");
-      openDrainWithArm();
-      break;
-
-    case BLE_CONTROLLER_ARM_CLOSE:
-      notifyBleControllerResult(command.requestId, true, "accepted");
-      closeDrainWithArm();
-      break;
-
-    case BLE_CONTROLLER_SERVO:
-      switch (command.servo) {
-        case BLE_CONTROLLER_SERVO_BASE:
-          setServoImmediate(
-            SERVO_BASE,
-            constrain(command.position, SERVO_BASE_MIN, SERVO_BASE_MAX)
-          );
-          break;
-        case BLE_CONTROLLER_SERVO_SHOULDER:
-          setServoImmediate(
-            SERVO_SHOULDER,
-            constrain(command.position, SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX)
-          );
-          break;
-        case BLE_CONTROLLER_SERVO_ELBOW:
-          setServoImmediate(
-            SERVO_ELBOW,
-            constrain(command.position, SERVO_ELBOW_MIN, SERVO_ELBOW_MAX)
-          );
-          break;
-        case BLE_CONTROLLER_SERVO_GRIPPER:
-          setServoImmediate(
-            SERVO_GRIPPER,
-            constrain(command.position, SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX)
-          );
-          break;
-      }
-      notifyBleControllerResult(command.requestId, true, "moved");
-      break;
-  }
-}
-
-// ============================================================================
-// NVS CREDENTIAL STORAGE
-// ============================================================================
-
-void loadSavedCredentials(String &ssid, String &pass) {
-  if (!prefs.begin(NVS_NAMESPACE, true)) return;
-  bool configured = prefs.getBool(NVS_KEY_SAVED, false);
-  if (configured) {
-    ssid = prefs.getString(NVS_KEY_SSID, "");
-    pass = prefs.getString(NVS_KEY_PASS, "");
-  }
-  prefs.end();
-  if (configured && ssid.length() > 0)
-    Serial.printf("[NVS] Loaded SSID: %s\n", ssid.c_str());
-}
-
-bool saveCredentials(const String &ssid, const String &pass) {
-  if (!prefs.begin(NVS_NAMESPACE, false)) return false;
-  bool ssidSaved = prefs.putString(NVS_KEY_SSID, ssid) == ssid.length();
-  // An empty password is valid for an open WiFi network.
-  prefs.putString(NVS_KEY_PASS, pass);
-  bool configuredSaved = prefs.putBool(NVS_KEY_SAVED, true) > 0;
-  bool ok = ssidSaved && configuredSaved;
-  prefs.end();
-  if (ok) Serial.printf("[NVS] Saved SSID: %s\n", ssid.c_str());
-  return ok;
-}
-
-// ============================================================================
-// HARDWARE INIT
+// HOTSPOT INIT
 // ============================================================================
 
 void initHotspot() {
@@ -817,56 +204,8 @@ void initHotspot() {
   sn.fromString("255.255.255.0");
   WiFi.softAPConfig(ip, gw, sn);
   bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
-  Serial.printf("[AP] Hotspot %s — %s\n", ok ? "started" : "FAILED", AP_IP);
-}
-
-void initBLE() {
-  uint64_t chipId = ESP.getEfuseMac();
-  char suffix[5];
-  snprintf(suffix, sizeof(suffix), "%04X", (uint16_t)(chipId & 0xFFFF));
-  deviceName = String(BLE_DEVICE_PREFIX) + "-" + suffix;
-
-  BLEDevice::init(deviceName.c_str());
-
-  // Create server first, THEN set MTU
-  bleServer = BLEDevice::createServer();
-  bleServer->setCallbacks(new BleServerCB());
-
-  // Request larger MTU so longer JSON payloads fit in one packet
-  BLEDevice::setMTU(185);
-
-  BLEService *svc = bleServer->createService(PROV_SERVICE_UUID);
-
-  // TX — ESP32 notifies phone (status updates)
-  bleTx = svc->createCharacteristic(
-    PROV_TX_UUID,
-    BLECharacteristic::PROPERTY_READ   |
-    BLECharacteristic::PROPERTY_NOTIFY |
-    BLECharacteristic::PROPERTY_INDICATE
-  );
-  bleTx->addDescriptor(new BLE2902());
-
-  // RX — phone writes WiFi credentials/commands
-  // WRITE_NR removed — Android uses WRITE_TYPE_DEFAULT which requires a response
-  BLECharacteristic *bleRx = svc->createCharacteristic(
-    PROV_RX_UUID,
-    BLECharacteristic::PROPERTY_WRITE
-  );
-  bleRx->setCallbacks(new BleWriteCB());
-
-  svc->start();
-
-  // Set a short initial value so READ works immediately on connect
-  bleTx->setValue("{\"status\":\"booting\"}");
-
-  BLEAdvertising *adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(PROV_SERVICE_UUID);
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
-  adv->setMaxPreferred(0x12);
-  BLEDevice::startAdvertising();
-
-  Serial.printf("[BLE] Advertising as: %s\n", deviceName.c_str());
+  Serial.printf("[AP] Hotspot %s — %s  SSID: %s\n",
+                ok ? "started" : "FAILED", AP_IP, AP_SSID);
 }
 
 // ============================================================================
@@ -875,9 +214,8 @@ void initBLE() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== DrainGuard Starting ===");
+  Serial.println("\n=== DrainGuard (Hotspot-Only) Starting ===");
 
-  // Pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(MOTOR_AIN1, OUTPUT); pinMode(MOTOR_AIN2, OUTPUT);
@@ -886,46 +224,27 @@ void setup() {
   pinMode(MOTOR_STBY, OUTPUT);
   stopMotors();
 
-  // LED
   pinMode(LED_BUILTIN_PIN, OUTPUT);
-  digitalWrite(LED_BUILTIN_PIN, LOW);
+  digitalWrite(LED_BUILTIN_PIN, HIGH);
 
-  // I2C + PCA9685
   Wire.begin(PCA9685_SDA, PCA9685_SCL);
   pwm.begin();
   pwm.setPWMFreq(SERVO_FREQ);
   delay(10);
 
-  // Serial modules
   gpsSerial.begin(115200, SERIAL_8N1, A9G_RX, A9G_TX);
   smsSerial.begin(115200, SERIAL_8N1, A7670_RX, A7670_TX);
 
-  // WiFi: AP + STA (hotspot always on, station connects to internet)
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_AP);
   WiFi.persistent(false);
 
-  bleControllerQueue = xQueueCreate(8, sizeof(BleControllerCommand));
-  if (bleControllerQueue == nullptr) {
-    Serial.println("[BLE] Failed to create controller command queue");
-  }
-
   initHotspot();
-  initBLE();
-
-  // Try saved credentials → fallback to compile-time default → wait for BLE
-  String savedSsid, savedPass;
-  loadSavedCredentials(savedSsid, savedPass);
-
-  if (savedSsid.length() > 0) {
-    startWifiConnection(savedSsid, savedPass, false);
-  } else {
-    Serial.println("[WiFi] No credentials — open BLE app and send WiFi details");
-  }
-
+  setupWebSocket();
   setupAPIEndpoints();
   server.begin();
+
   Serial.printf("[HTTP] API ready at http://%s\n", AP_IP);
+  Serial.printf("  Connect phone to WiFi: %s  /  Password: %s\n\n", AP_SSID, AP_PASSWORD);
 }
 
 // ============================================================================
@@ -933,30 +252,17 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  // BLE provisioning tasks (all non-blocking)
-  updateWifiState();
-  updateWifiScan();
-  restartBleAdv();
-  processBleControllerCommand();
-
-  // LED status indicator
   updateLED();
-
-  // HTTP server
-  server.handleClient();
-
-  // GPS — read serial bytes whenever available
+  wsServer.loop();      // WebSocket — must be first, handles all real-time commands
+  server.handleClient(); // HTTP — status, camera, etc.
   updateGPS();
-
-  // SMS state machine — non-blocking send
   updateSMS();
 
-  // Sensor + alert every SENSOR_INTERVAL ms
   if (millis() - state.lastSensorUpdate >= SENSOR_INTERVAL) {
     state.distance   = readUltrasonic();
     state.waterLevel = (state.distance > 0) ? (TANK_HEIGHT - state.distance) : 0;
-    Serial.printf("[Sensor] Distance: %.1f cm  WaterLevel: %.1f cm  GPS: %s\n",
-                  state.distance, state.waterLevel, gpsValid ? "fix" : "no fix");
+    Serial.printf("[Sensor] dist=%.1fcm  level=%.1fcm  gps=%s\n",
+                  state.distance, state.waterLevel, gpsValid ? "fix" : "none");
     checkAlerts();
     state.lastSensorUpdate = millis();
   }
@@ -970,8 +276,7 @@ void loop() {
 // ============================================================================
 
 void checkAlerts() {
-  if (state.distance <= 0) return;   // invalid reading
-
+  if (state.distance <= 0) return;
   if (state.distance < CRITICAL_DIST && !state.alertSent) {
     Serial.println("[ALERT] Critical water level!");
     state.alertSent = true;
@@ -986,28 +291,39 @@ void checkAlerts() {
 // MOTOR FUNCTIONS
 // ============================================================================
 
-void openDrain() {
+// Run motor forward for DRAIN_OPEN_MS then stop — in background task
+static void drainOpenTask(void *) {
   Serial.println("[Motor] Opening drain");
   digitalWrite(MOTOR_STBY, HIGH);
   digitalWrite(MOTOR_AIN1, HIGH); digitalWrite(MOTOR_AIN2, LOW);
   analogWrite(MOTOR_PWMA, MOTOR_SPEED);
   digitalWrite(MOTOR_BIN1, HIGH); digitalWrite(MOTOR_BIN2, LOW);
   analogWrite(MOTOR_PWMB, MOTOR_SPEED);
-  delay(DRAIN_OPEN_MS);
+  vTaskDelay(pdMS_TO_TICKS(DRAIN_OPEN_MS));
   stopMotors();
   state.drainOpen = true;
+  vTaskDelete(nullptr);
 }
 
-void closeDrain() {
+static void drainCloseTask(void *) {
   Serial.println("[Motor] Closing drain");
   digitalWrite(MOTOR_STBY, HIGH);
   digitalWrite(MOTOR_AIN1, LOW); digitalWrite(MOTOR_AIN2, HIGH);
   analogWrite(MOTOR_PWMA, MOTOR_SPEED);
   digitalWrite(MOTOR_BIN1, LOW); digitalWrite(MOTOR_BIN2, HIGH);
   analogWrite(MOTOR_PWMB, MOTOR_SPEED);
-  delay(DRAIN_CLOSE_MS);
+  vTaskDelay(pdMS_TO_TICKS(DRAIN_CLOSE_MS));
   stopMotors();
   state.drainOpen = false;
+  vTaskDelete(nullptr);
+}
+
+void openDrain() {
+  xTaskCreate(drainOpenTask, "drainOpen", 2048, nullptr, 1, nullptr);
+}
+
+void closeDrain() {
+  xTaskCreate(drainCloseTask, "drainClose", 2048, nullptr, 1, nullptr);
 }
 
 void stopMotors() {
@@ -1019,7 +335,16 @@ void stopMotors() {
 
 // ============================================================================
 // SERVO FUNCTIONS
+// Servos are CONTINUOUS ROTATION type.
+// Control method: set PWM to spin value for N milliseconds, then cut signal.
+// SERVO_STOP = 0 means no PWM pulse = no torque = servo holds position.
+// Spin values: >307 = one direction, <307 = other direction
 // ============================================================================
+
+// Spin speed values — close to 307 = slower, far = faster
+#define SERVO_FWD    340   // forward spin
+#define SERVO_REV    270   // reverse spin
+#define SERVO_STOP     0   // no pulse = no torque = holds
 
 uint16_t getServoPosition(uint8_t ch) {
   switch (ch) {
@@ -1031,205 +356,161 @@ uint16_t getServoPosition(uint8_t ch) {
   }
 }
 
-void setServo(uint8_t ch, uint16_t pos) {
-  pwm.setPWM(ch, 0, pos);
-  switch (ch) {
-    case SERVO_BASE:     basePos = pos; break;
-    case SERVO_SHOULDER: shoulderPos = pos; break;
-    case SERVO_ELBOW:    elbowPos = pos; break;
-    case SERVO_GRIPPER:  gripperPos = pos; break;
-  }
+void setServo(uint8_t ch, uint16_t val) {
+  pwm.setPWM(ch, 0, val);
 }
 
-// Direct move — no delay, used for joystick/manual control from the app.
-// The app controls speed by how fast it sends commands.
-void setServoImmediate(uint8_t ch, uint16_t pos) {
-  setServo(ch, pos);
+void setServoImmediate(uint8_t ch, uint16_t val) {
+  pwm.setPWM(ch, 0, val);
 }
 
-// Smooth move — used only for pre-programmed arm sequences (open/close drain).
-// This BLOCKS loop() while running — call from arm action endpoints only,
-// not from any code that needs the server to stay responsive.
-void setServoSmooth(uint8_t ch, uint16_t target, int stepDelayMs) {
-  int current = getServoPosition(ch);
-  int direction = target >= (uint16_t)current ? 1 : -1;
-  for (int pos = current; pos != (int)target; pos += direction) {
-    setServo(ch, static_cast<uint16_t>(pos));
-    delay(stepDelayMs);
-  }
-  setServo(ch, target);
+// Spin a servo for `ms` milliseconds in given direction, then stop.
+// Call ONLY from inside a FreeRTOS task.
+void servoSpin(uint8_t ch, uint16_t direction, uint32_t ms) {
+  pwm.setPWM(ch, 0, direction);
+  vTaskDelay(pdMS_TO_TICKS(ms));
+  pwm.setPWM(ch, 0, SERVO_STOP);
+  vTaskDelay(pdMS_TO_TICKS(50)); // brief settle
+}
+
+// Arm sequence — all timing tuned for continuous rotation servos
+static void armHomeTask(void *) {
+  Serial.println("[Arm] Home");
+  servoSpin(SERVO_GRIPPER,  SERVO_REV, 400);  // open gripper
+  servoSpin(SERVO_ELBOW,    SERVO_REV, 300);  // retract elbow
+  servoSpin(SERVO_SHOULDER, SERVO_REV, 400);  // raise shoulder
+  servoSpin(SERVO_BASE,     SERVO_FWD, 300);  // center base
+  vTaskDelete(nullptr);
+}
+
+static void armOpenTask(void *) {
+  Serial.println("[Arm] Open drain");
+  servoSpin(SERVO_BASE,     SERVO_REV, 400);  // rotate base
+  servoSpin(SERVO_SHOULDER, SERVO_FWD, 400);  // lower shoulder
+  servoSpin(SERVO_ELBOW,    SERVO_FWD, 300);  // extend elbow
+  servoSpin(SERVO_GRIPPER,  SERVO_FWD, 400);  // close gripper
+  state.drainOpen = true;
+  vTaskDelete(nullptr);
+}
+
+static void armCloseTask(void *) {
+  Serial.println("[Arm] Close drain");
+  servoSpin(SERVO_GRIPPER,  SERVO_REV, 400);  // open gripper
+  servoSpin(SERVO_ELBOW,    SERVO_REV, 300);  // retract elbow
+  servoSpin(SERVO_SHOULDER, SERVO_REV, 400);  // raise shoulder
+  servoSpin(SERVO_BASE,     SERVO_FWD, 400);  // center base
+  state.drainOpen = false;
+  vTaskDelete(nullptr);
 }
 
 void moveArmHome() {
-  Serial.println("[Arm] Returning home");
-  setServoSmooth(SERVO_BASE, 330);
-  delay(100);
-  setServoSmooth(SERVO_SHOULDER, 150);
-  delay(100);
-  setServoSmooth(SERVO_ELBOW, 300);
-  delay(100);
-  setServoSmooth(SERVO_GRIPPER, 410);
+  xTaskCreate(armHomeTask, "armHome", 3072, nullptr, 1, nullptr);
 }
 
 void openDrainWithArm() {
-  Serial.println("[Arm] Opening drain");
-  setServoSmooth(SERVO_BASE, 250);
-  delay(500);
-  setServoSmooth(SERVO_SHOULDER, 380);
-  delay(500);
-  setServoSmooth(SERVO_ELBOW, 380);
-  delay(500);
-  setServoSmooth(SERVO_GRIPPER, 510);
-  delay(1000);
-  state.drainOpen = true;
+  xTaskCreate(armOpenTask, "armOpen", 3072, nullptr, 1, nullptr);
 }
 
 void closeDrainWithArm() {
-  Serial.println("[Arm] Closing drain");
-  setServoSmooth(SERVO_GRIPPER, 410);
-  delay(500);
-  setServoSmooth(SERVO_ELBOW, 300);
-  delay(500);
-  setServoSmooth(SERVO_SHOULDER, 150);
-  delay(500);
-  setServoSmooth(SERVO_BASE, 330);
-  delay(500);
-  state.drainOpen = false;
+  xTaskCreate(armCloseTask, "armClose", 3072, nullptr, 1, nullptr);
 }
 
-void updateAutoMode() {
-  if (!autoModeEnabled) {
-    autoModeOperating = false;
-    autoStep = AUTO_IDLE;
-    return;
-  }
+// ============================================================================
+// AUTO MODE
+// ============================================================================
 
+void updateAutoMode() {
+  if (!autoModeEnabled) { autoModeOperating = false; autoStep = AUTO_IDLE; return; }
   unsigned long now = millis();
   switch (autoStep) {
     case AUTO_IDLE:
-      // readUltrasonic() returns -1 for a timeout or out-of-range reading.
-      // Reject all non-positive values before comparing with the threshold.
-      if (
-        state.distance > 0 &&
-        state.distance <= autoDetectionRange &&
-        now - autoLastOperation >= AUTO_OPERATION_COOLDOWN_MS
-      ) {
+      if (state.distance > 0 &&
+          state.distance <= autoDetectionRange &&
+          now - autoLastOperation >= AUTO_OPERATION_COOLDOWN_MS) {
         autoModeOperating = true;
         autoLastOperation = now;
         openDrainWithArm();
-        autoStep = AUTO_OPENING;
+        autoStep     = AUTO_OPENING;
         autoStepTime = millis();
       }
       break;
-
     case AUTO_OPENING:
-      if (now - autoStepTime >= 3000) {
-        autoStep = AUTO_WAITING;
-        autoStepTime = now;
-      }
+      if (now - autoStepTime >= 3000) { autoStep = AUTO_WAITING; autoStepTime = now; }
       break;
-
     case AUTO_WAITING:
-      if (now - autoStepTime >= 2000) {
-        closeDrainWithArm();
-        autoStep = AUTO_CLOSING;
-        autoStepTime = millis();
-      }
+      if (now - autoStepTime >= 2000) { closeDrainWithArm(); autoStep = AUTO_CLOSING; autoStepTime = millis(); }
       break;
-
     case AUTO_CLOSING:
-      if (now - autoStepTime >= 3000) {
-        moveArmHome();
-        autoStep = AUTO_HOMING;
-        autoStepTime = millis();
-      }
+      if (now - autoStepTime >= 3000) { moveArmHome(); autoStep = AUTO_HOMING; autoStepTime = millis(); }
       break;
-
     case AUTO_HOMING:
-      if (now - autoStepTime >= 2000) {
-        autoModeOperating = false;
-        autoStep = AUTO_COOLDOWN;
-        autoStepTime = now;
-      }
+      if (now - autoStepTime >= 2000) { autoModeOperating = false; autoStep = AUTO_COOLDOWN; autoStepTime = now; }
       break;
-
     case AUTO_COOLDOWN:
-      if (now - autoStepTime >= 5000) {
-        autoStep = AUTO_IDLE;
-      }
+      if (now - autoStepTime >= 5000) { autoStep = AUTO_IDLE; }
       break;
   }
 }
 
-// ── Camera availability cache (updated in background, never in a handler) ──
-bool          cameraAvailable       = false;
-unsigned long cameraLastCheck       = 0;
+// ============================================================================
+// CAMERA STATUS (background probe — runs in FreeRTOS task so HTTP doesn't block loop)
+// ============================================================================
 
-// Called from loop() — probes ESP32-CAM in the background every 10 seconds.
-// Never call this from inside a server.on() handler or it will block the loop.
-void updateCameraStatus() {
-  if (millis() - cameraLastCheck < CAMERA_CHECK_INTERVAL_MS) return;
-  cameraLastCheck = millis();
-
+static void cameraProbeTask(void *) {
   HTTPClient http;
-  String url = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/status";
+  String url = String("http://") + CAMERA_IP + ":" + CAMERA_PORT + "/status";
   http.begin(url);
   http.setTimeout(CAMERA_CHECK_TIMEOUT_MS);
   int code = http.GET();
   http.end();
-  cameraAvailable = (code == HTTP_CODE_OK);
-  Serial.printf("[CAM] Probe %s\n", cameraAvailable ? "OK" : "offline");
+  cameraAvailable       = (code == HTTP_CODE_OK);
+  cameraState.available = cameraAvailable;
+  vTaskDelete(nullptr);
+}
+
+void updateCameraStatus() {
+  if (millis() - cameraLastCheck < CAMERA_CHECK_INTERVAL_MS) return;
+  cameraLastCheck = millis();
+  xTaskCreate(cameraProbeTask, "camProbe", 4096, nullptr, 1, nullptr);
 }
 
 // ============================================================================
-// ULTRASONIC SENSOR
+// ULTRASONIC
 // ============================================================================
 
 float readUltrasonic() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
   long dur = pulseIn(ECHO_PIN, HIGH, 30000);
   if (dur == 0) return -1;
-  float dist = dur * 0.034f / 2.0f;
-  return (dist < 2 || dist > MAX_DISTANCE) ? -1 : dist;
+  float d = dur * 0.034f / 2.0f;
+  return (d < 2 || d > MAX_DISTANCE) ? -1 : d;
 }
 
 // ============================================================================
-// GPS (A9G) — reads NMEA sentences from Serial1
+// GPS (A9G)
 // ============================================================================
 
-// Parse $GPGGA or $GNGGA sentence for lat/lon/satellites
 void parseGGA(const String &sentence) {
-  // Field indices: $GPGGA,time,lat,NS,lon,EW,fix,sats,...
-  int field = 0;
-  int start = 0;
+  int field = 0, start = 0;
   String fields[10];
-
-  for (int i = 0; i <= sentence.length() && field < 10; i++) {
-    if (i == sentence.length() || sentence[i] == ',') {
+  for (int i = 0; i <= (int)sentence.length() && field < 10; i++) {
+    if (i == (int)sentence.length() || sentence[i] == ',') {
       fields[field++] = sentence.substring(start, i);
       start = i + 1;
     }
   }
+  if (field < 8 || fields[6] == "0" || fields[6] == "") return;
 
-  if (field < 8) return;
-  if (fields[6] == "0" || fields[6] == "") return; // no fix
-
-  // Latitude: DDMM.MMMM
   float rawLat = fields[2].toFloat();
   int   latDeg = (int)(rawLat / 100);
-  float latMin = rawLat - latDeg * 100;
-  gpsLat = latDeg + latMin / 60.0f;
+  gpsLat = latDeg + (rawLat - latDeg * 100) / 60.0f;
   if (fields[3] == "S") gpsLat = -gpsLat;
 
-  // Longitude: DDDMM.MMMM
   float rawLon = fields[4].toFloat();
   int   lonDeg = (int)(rawLon / 100);
-  float lonMin = rawLon - lonDeg * 100;
-  gpsLon = lonDeg + lonMin / 60.0f;
+  gpsLon = lonDeg + (rawLon - lonDeg * 100) / 60.0f;
   if (fields[5] == "W") gpsLon = -gpsLon;
 
   gpsSatCount = fields[7].toInt();
@@ -1241,24 +522,22 @@ void updateGPS() {
     char c = gpsSerial.read();
     if (c == '\n') {
       gpsBuffer.trim();
-      if (gpsBuffer.startsWith("$GPGGA") || gpsBuffer.startsWith("$GNGGA")) {
+      if (gpsBuffer.startsWith("$GPGGA") || gpsBuffer.startsWith("$GNGGA"))
         parseGGA(gpsBuffer);
-      }
       gpsBuffer = "";
     } else if (c != '\r') {
       gpsBuffer += c;
-      if (gpsBuffer.length() > 120) gpsBuffer = ""; // overflow guard
+      if (gpsBuffer.length() > 120) gpsBuffer = "";
     }
   }
 }
 
 // ============================================================================
-// SMS (A7670) — non-blocking send via state machine
+// SMS (A7670)
 // ============================================================================
 
-// Queue one SMS — call this instead of sending inline
 void sendSMS(const String &number, const String &msg) {
-  if (smsState != SMS_IDLE) return; // already sending — drop duplicate
+  if (smsState != SMS_IDLE) return;
   smsNumber  = number;
   smsPending = msg;
   smsState   = SMS_CMGF;
@@ -1266,96 +545,196 @@ void sendSMS(const String &number, const String &msg) {
   Serial.printf("[SMS] Queued to %s\n", number.c_str());
 }
 
-// Call from loop() — advances the SMS send state machine without blocking
 void updateSMS() {
   switch (smsState) {
     case SMS_IDLE: break;
-
     case SMS_CMGF:
       smsSerial.println("AT+CMGF=1");
-      smsState = SMS_NUMBER;
-      smsTimer = millis();
-      break;
-
+      smsState = SMS_NUMBER; smsTimer = millis(); break;
     case SMS_NUMBER:
       if (millis() - smsTimer < 300) break;
-      smsSerial.print("AT+CMGS=\"");
-      smsSerial.print(smsNumber);
-      smsSerial.println("\"");
-      smsState = SMS_BODY;
-      smsTimer = millis();
-      break;
-
+      smsSerial.print("AT+CMGS=\""); smsSerial.print(smsNumber); smsSerial.println("\"");
+      smsState = SMS_BODY; smsTimer = millis(); break;
     case SMS_BODY:
       if (millis() - smsTimer < 300) break;
-      smsSerial.print(smsPending);
-      smsSerial.write(26); // Ctrl+Z
-      smsState = SMS_WAIT;
-      smsTimer = millis();
-      break;
-
+      smsSerial.print(smsPending); smsSerial.write(26);
+      smsState = SMS_WAIT; smsTimer = millis(); break;
     case SMS_WAIT:
-      if (millis() - smsTimer < 4000) break; // wait for modem response
+      if (millis() - smsTimer < 4000) break;
       Serial.printf("[SMS] Sent to %s\n", smsNumber.c_str());
-      smsState = SMS_IDLE;
-      break;
+      smsState = SMS_IDLE; break;
   }
 }
 
 // ============================================================================
-// LED STATUS INDICATOR (GPIO 2 — built-in blue LED)
+// LED  (slow blink = hotspot active)
 // ============================================================================
-//
-//  Pattern               Meaning
-//  ─────────────────     ──────────────────────────────────────────
-//  Slow blink (1s)       Waiting — no BLE and no WiFi
-//  Fast blink (200ms)    BLE advertising — waiting for phone to connect
-//  SOLID ON              BLE phone connected ✅
-//  Double blink          WiFi connected to internet ✅
-//
+
 void updateLED() {
   unsigned long now = millis();
-
-  if (bleConnected) {
-    // SOLID ON — phone is connected via BLE
-    digitalWrite(LED_BUILTIN_PIN, HIGH);
-    ledState = true;
-
-  } else if (WiFi.status() == WL_CONNECTED) {
-    // Double blink every 1.5s — WiFi connected to internet
-    unsigned long t = now % 1500;
-    bool on = (t < 100) || (t > 200 && t < 300);
-    if (on != ledState) {
-      ledState = on;
-      digitalWrite(LED_BUILTIN_PIN, on ? HIGH : LOW);
-    }
-
-  } else if (wifiConnState == WCS_CONNECTING) {
-    // Fast blink 100ms — connecting to WiFi
-    if (now - ledTimer >= 100) {
-      ledTimer = now;
-      ledState = !ledState;
-      digitalWrite(LED_BUILTIN_PIN, ledState ? HIGH : LOW);
-    }
-
-  } else {
-    // Slow blink 800ms — idle, advertising BLE, waiting for provisioning
-    if (now - ledTimer >= 800) {
-      ledTimer = now;
-      ledState = !ledState;
-      digitalWrite(LED_BUILTIN_PIN, ledState ? HIGH : LOW);
-    }
+  if (now - ledTimer >= 1000) {
+    ledTimer = now;
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN_PIN, ledState ? HIGH : LOW);
   }
 }
 
 // ============================================================================
-// HTTP API ENDPOINTS
+// WEBSOCKET HANDLER — port 81, handles all real-time motor/servo commands
+// ============================================================================
+
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client %u connected\n", num);
+      // Send current status on connect
+      {
+        StaticJsonDocument<256> doc;
+        doc["type"]       = "status";
+        doc["water_level"] = state.waterLevel;
+        doc["distance"]    = state.distance;
+        doc["drain_open"]  = state.drainOpen;
+        doc["base"]        = basePos;
+        doc["shoulder"]    = shoulderPos;
+        String out; serializeJson(doc, out);
+        wsServer.sendTXT(num, out);
+      }
+      break;
+
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      // Safety: stop motors when client disconnects
+      stopMotors();
+      break;
+
+    case WStype_TEXT: {
+      StaticJsonDocument<256> doc;
+      if (deserializeJson(doc, payload, length)) return;
+      const char *cmd = doc["cmd"] | "";
+
+      if (strcmp(cmd, "motor") == 0) {
+        const char *dir = doc["dir"] | "";
+        if (strcmp(dir, "forward") == 0) {
+          // Continuous — stays on until "stop" is sent
+          digitalWrite(MOTOR_STBY, HIGH);
+          digitalWrite(MOTOR_AIN1, HIGH); digitalWrite(MOTOR_AIN2, LOW);
+          analogWrite(MOTOR_PWMA, MOTOR_WIFI_SPEED);
+          digitalWrite(MOTOR_BIN1, HIGH); digitalWrite(MOTOR_BIN2, LOW);
+          analogWrite(MOTOR_PWMB, MOTOR_WIFI_SPEED);
+        } else if (strcmp(dir, "backward") == 0) {
+          // Continuous — stays on until "stop" is sent
+          digitalWrite(MOTOR_STBY, HIGH);
+          digitalWrite(MOTOR_AIN1, LOW); digitalWrite(MOTOR_AIN2, HIGH);
+          analogWrite(MOTOR_PWMA, MOTOR_WIFI_SPEED);
+          digitalWrite(MOTOR_BIN1, LOW); digitalWrite(MOTOR_BIN2, HIGH);
+          analogWrite(MOTOR_PWMB, MOTOR_WIFI_SPEED);
+        } else if (strcmp(dir, "left")  == 0) startMotorPulse(LOW,  HIGH, HIGH, LOW);
+        else if   (strcmp(dir, "right") == 0) startMotorPulse(HIGH, LOW,  LOW,  HIGH);
+        else if   (strcmp(dir, "stop")  == 0) stopMotors();
+        wsServer.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"motor\"}");
+
+      } else if (strcmp(cmd, "servo") == 0) {
+        const char *joint = doc["joint"] | "";
+        const char *dir   = doc["dir"]   | "";
+
+        uint8_t ch = 255;
+        if      (strcmp(joint, "base")     == 0) ch = SERVO_BASE;
+        else if (strcmp(joint, "shoulder") == 0) ch = SERVO_SHOULDER;
+        else if (strcmp(joint, "elbow")    == 0) ch = SERVO_ELBOW;
+        else if (strcmp(joint, "gripper")  == 0) ch = SERVO_GRIPPER;
+        if (ch == 255) return;
+
+        uint16_t spinVal = (strcmp(dir, "fwd") == 0) ? SERVO_FWD : SERVO_REV;
+        pwm.setPWM(ch, 0, spinVal);
+
+        // Auto-stop after 220ms
+        struct ServoStop { uint8_t ch; };
+        ServoStop *s = (ServoStop *)malloc(sizeof(ServoStop));
+        if (s) {
+          s->ch = ch;
+          xTaskCreate([](void *arg) {
+            ServoStop *s = (ServoStop *)arg;
+            vTaskDelay(pdMS_TO_TICKS(220));
+            pwm.setPWM(s->ch, 0, SERVO_STOP); // no pulse = no torque = holds
+            free(s);
+            vTaskDelete(nullptr);
+          }, "sStop", 1024, s, 1, nullptr);
+        }
+        wsServer.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"servo\"}");
+
+      } else if (strcmp(cmd, "arm") == 0) {
+        const char *action = doc["action"] | "";
+        if      (strcmp(action, "open")  == 0) openDrainWithArm();
+        else if (strcmp(action, "close") == 0) closeDrainWithArm();
+        else if (strcmp(action, "home")  == 0) moveArmHome();
+        wsServer.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"arm\"}");
+
+      } else if (strcmp(cmd, "get_status") == 0) {
+        StaticJsonDocument<256> resp;
+        resp["type"]        = "status";
+        resp["water_level"] = state.waterLevel;
+        resp["distance"]    = state.distance;
+        resp["drain_open"]  = state.drainOpen;
+        resp["base"]        = basePos;
+        resp["shoulder"]    = shoulderPos;
+        String out; serializeJson(resp, out);
+        wsServer.sendTXT(num, out);
+      }
+      break;
+    }
+
+    default: break;
+  }
+}
+
+void setupWebSocket() {
+  wsServer.begin();
+  wsServer.onEvent(onWebSocketEvent);
+  Serial.printf("[WS] WebSocket server started on port 81\n");
+}
+
+// ============================================================================
+// MOTOR PULSE — runs motor for 350ms per tap, auto-stops, non-blocking
+// ============================================================================
+
+#define MOTOR_PULSE_MS   350  // ms per tap
+
+struct MotorPulse {
+  uint8_t ain1, ain2, bin1, bin2;
+};
+
+static void motorPulseTask(void *arg) {
+  MotorPulse *p = (MotorPulse *)arg;
+  // Wait 80ms so HTTP response finishes before we draw motor current
+  vTaskDelay(pdMS_TO_TICKS(80));
+  digitalWrite(MOTOR_STBY, HIGH);
+  digitalWrite(MOTOR_AIN1, p->ain1); digitalWrite(MOTOR_AIN2, p->ain2);
+  analogWrite(MOTOR_PWMA, MOTOR_WIFI_SPEED);
+  digitalWrite(MOTOR_BIN1, p->bin1); digitalWrite(MOTOR_BIN2, p->bin2);
+  analogWrite(MOTOR_PWMB, MOTOR_WIFI_SPEED);
+  vTaskDelay(pdMS_TO_TICKS(MOTOR_PULSE_MS));
+  stopMotors();
+  // 80ms pause after stop — lets WiFi stack recover
+  vTaskDelay(pdMS_TO_TICKS(80));
+  free(p);
+  vTaskDelete(nullptr);
+}
+
+static void startMotorPulse(uint8_t ain1, uint8_t ain2, uint8_t bin1, uint8_t bin2) {
+  MotorPulse *p = (MotorPulse *)malloc(sizeof(MotorPulse));
+  if (!p) return;
+  p->ain1 = ain1; p->ain2 = ain2;
+  p->bin1 = bin1; p->bin2 = bin2;
+  xTaskCreate(motorPulseTask, "motorPulse", 2048, p, 1, nullptr);
+}
+
 // ============================================================================
 
 void setupAPIEndpoints() {
-  // CORS preflight — required for browsers
+
+  // CORS preflight
   server.onNotFound([]() {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Origin",  "*");
     server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
     if (server.method() == HTTP_OPTIONS) server.send(204);
@@ -1365,24 +744,21 @@ void setupAPIEndpoints() {
   // GET /api/status
   server.on("/api/status", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    StaticJsonDocument<384> doc;
-    doc["device_id"]        = DEVICE_ID;
-    doc["water_level"]      = state.waterLevel;
-    doc["distance"]         = state.distance;
-    doc["drain_open"]       = state.drainOpen;
-    doc["wifi_connected"]   = (WiFi.status() == WL_CONNECTED);
-    doc["wifi_ip"]          = (WiFi.status() == WL_CONNECTED)
-                              ? WiFi.localIP().toString() : "";
-    doc["camera_available"] = cameraAvailable;
-    doc["latitude"]         = gpsLat;
-    doc["longitude"]        = gpsLon;
-    doc["satellites"]       = gpsSatCount;
-    doc["gps_valid"]        = gpsValid;
-    // Health diagnostics — visible from app without USB cable
-    doc["uptime_s"]         = (unsigned long)(millis() / 1000);
-    doc["free_heap"]        = (int)ESP.getFreeHeap();
-    doc["reset_reason"]     = (int)esp_reset_reason();
-    doc["brownout"]         = (esp_reset_reason() == ESP_RST_BROWNOUT);
+    StaticJsonDocument<512> doc;
+    doc["device_id"]         = DEVICE_ID;
+    doc["water_level"]       = state.waterLevel;
+    doc["distance"]          = state.distance;
+    doc["drain_open"]        = state.drainOpen;
+    doc["camera_available"]  = cameraAvailable;
+    doc["camera_streaming"]  = cameraState.streaming;
+    doc["camera_quality"]    = cameraState.quality;
+    doc["latitude"]          = gpsLat;
+    doc["longitude"]         = gpsLon;
+    doc["satellites"]        = gpsSatCount;
+    doc["gps_valid"]         = gpsValid;
+    doc["uptime_s"]          = (unsigned long)(millis() / 1000);
+    doc["free_heap"]         = (int)ESP.getFreeHeap();
+    doc["clients_connected"] = (int)WiFi.softAPgetStationNum();
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
@@ -1401,19 +777,58 @@ void setupAPIEndpoints() {
     server.send(200, "application/json", "{\"status\":\"closed\"}");
   });
 
-  // Robotic arm actions used by the mobile camera controls.
+  // ── Motor / Wheel Control ────────────────────────────────────────────────
+
+  // POST /api/motor/forward
+  server.on("/api/motor/forward", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startMotorPulse(HIGH, LOW, HIGH, LOW);
+    server.send(200, "application/json", "{\"status\":\"forward\"}");
+  });
+
+  // POST /api/motor/backward
+  server.on("/api/motor/backward", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startMotorPulse(LOW, HIGH, LOW, HIGH);
+    server.send(200, "application/json", "{\"status\":\"backward\"}");
+  });
+
+  // POST /api/motor/left
+  server.on("/api/motor/left", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startMotorPulse(LOW, HIGH, HIGH, LOW);
+    server.send(200, "application/json", "{\"status\":\"left\"}");
+  });
+
+  // POST /api/motor/right
+  server.on("/api/motor/right", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startMotorPulse(HIGH, LOW, LOW, HIGH);
+    server.send(200, "application/json", "{\"status\":\"right\"}");
+  });
+
+  // POST /api/motor/stop
+  server.on("/api/motor/stop", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    stopMotors();
+    server.send(200, "application/json", "{\"status\":\"stopped\"}");
+  });
+
+  // POST /api/arm/open
   server.on("/api/arm/open", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     openDrainWithArm();
-    server.send(200, "application/json", "{\"status\":\"opened\",\"method\":\"servo_arm\"}");
+    server.send(200, "application/json", "{\"status\":\"opened\"}");
   });
 
+  // POST /api/arm/close
   server.on("/api/arm/close", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     closeDrainWithArm();
-    server.send(200, "application/json", "{\"status\":\"closed\",\"method\":\"servo_arm\"}");
+    server.send(200, "application/json", "{\"status\":\"closed\"}");
   });
 
+  // POST /api/arm/home
   server.on("/api/arm/home", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     moveArmHome();
@@ -1423,7 +838,9 @@ void setupAPIEndpoints() {
   // POST /api/servo/base?position=330
   server.on("/api/servo/base", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
+    if (!server.hasArg("position")) {
+      server.send(400, "application/json", "{\"error\":\"missing position\"}"); return;
+    }
     int pos = constrain(server.arg("position").toInt(), SERVO_BASE_MIN, SERVO_BASE_MAX);
     setServoImmediate(SERVO_BASE, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
@@ -1432,7 +849,9 @@ void setupAPIEndpoints() {
   // POST /api/servo/shoulder?position=200
   server.on("/api/servo/shoulder", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
+    if (!server.hasArg("position")) {
+      server.send(400, "application/json", "{\"error\":\"missing position\"}"); return;
+    }
     int pos = constrain(server.arg("position").toInt(), SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
     setServoImmediate(SERVO_SHOULDER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
@@ -1441,7 +860,9 @@ void setupAPIEndpoints() {
   // POST /api/servo/elbow?position=340
   server.on("/api/servo/elbow", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
+    if (!server.hasArg("position")) {
+      server.send(400, "application/json", "{\"error\":\"missing position\"}"); return;
+    }
     int pos = constrain(server.arg("position").toInt(), SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
     setServoImmediate(SERVO_ELBOW, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
@@ -1450,81 +871,62 @@ void setupAPIEndpoints() {
   // POST /api/servo/gripper?position=460
   server.on("/api/servo/gripper", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (!server.hasArg("position")) { server.send(400, "application/json", "{\"error\":\"missing position\"}"); return; }
+    if (!server.hasArg("position")) {
+      server.send(400, "application/json", "{\"error\":\"missing position\"}"); return;
+    }
     int pos = constrain(server.arg("position").toInt(), SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
     setServoImmediate(SERVO_GRIPPER, pos);
     server.send(200, "application/json", "{\"status\":\"moved\",\"position\":" + String(pos) + "}");
   });
 
+  // GET /api/servo/status
   server.on("/api/servo/status", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     StaticJsonDocument<192> doc;
-    doc["base"] = basePos;
+    doc["base"]     = basePos;
     doc["shoulder"] = shoulderPos;
-    doc["elbow"] = elbowPos;
-    doc["gripper"] = gripperPos;
-    String out;
-    serializeJson(doc, out);
+    doc["elbow"]    = elbowPos;
+    doc["gripper"]  = gripperPos;
+    String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
 
+  // POST /api/auto/start
   server.on("/api/auto/start", HTTP_POST, []() {
-    autoModeEnabled = true;
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    autoModeEnabled = true;
     server.send(200, "application/json", "{\"status\":\"started\"}");
   });
 
+  // POST /api/auto/stop
   server.on("/api/auto/stop", HTTP_POST, []() {
-    autoModeEnabled = false;
-    autoModeOperating = false;
-    autoStep = AUTO_IDLE;
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    autoModeEnabled   = false;
+    autoModeOperating = false;
+    autoStep          = AUTO_IDLE;
     server.send(200, "application/json", "{\"status\":\"stopped\"}");
   });
 
+  // GET /api/auto/status
   server.on("/api/auto/status", HTTP_GET, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     StaticJsonDocument<160> doc;
-    doc["enabled"] = autoModeEnabled;
-    doc["operating"] = autoModeOperating;
+    doc["enabled"]         = autoModeEnabled;
+    doc["operating"]       = autoModeOperating;
     doc["detection_range"] = autoDetectionRange;
-    String out;
-    serializeJson(doc, out);
+    String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
 
+  // POST /api/auto/range?value=30.5
   server.on("/api/auto/range", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    if (!server.hasArg("range")) {
-      server.send(400, "application/json", "{\"error\":\"missing range parameter\"}");
-      return;
+    if (!server.hasArg("value")) {
+      server.send(400, "application/json", "{\"error\":\"missing value\"}"); return;
     }
-
-    float range = server.arg("range").toFloat();
-    if (range <= 0 || range > MAX_DISTANCE) {
-      server.send(400, "application/json", "{\"error\":\"range must be between 0 and 400 cm\"}");
-      return;
-    }
-
-    autoDetectionRange = range;
-    server.send(200, "application/json", "{\"status\":\"updated\"}");
-  });
-
-  // Return the ESP32-CAM stream URL from the cached availability value.
-  // The camera is probed in the background by updateCameraStatus() in loop(),
-  // so this handler returns immediately without blocking.
-  server.on("/api/camera/stream", HTTP_GET, []() {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    StaticJsonDocument<192> doc;
-    doc["available"] = cameraAvailable;
-    if (cameraAvailable) {
-      doc["stream_url"] = String("http://") + CAMERA_IP + ":" + String(CAMERA_PORT) + "/stream";
-    } else {
-      doc["stream_url"] = "";
-    }
-    String out;
-    serializeJson(doc, out);
-    server.send(200, "application/json", out);
+    autoDetectionRange = server.arg("value").toFloat();
+    server.send(200, "application/json",
+      "{\"status\":\"updated\",\"range\":" + String(autoDetectionRange) + "}");
   });
 
   // GET /api/gps
@@ -1537,5 +939,45 @@ void setupAPIEndpoints() {
     doc["valid"]      = gpsValid;
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
+  });
+
+  // GET /api/camera/status
+  server.on("/api/camera/status", HTTP_GET, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    StaticJsonDocument<256> doc;
+    doc["available"]  = cameraAvailable;
+    doc["streaming"]  = cameraState.streaming;
+    doc["quality"]    = cameraState.quality;
+    doc["brightness"] = cameraState.brightness;
+    doc["contrast"]   = cameraState.contrast;
+    doc["flash"]      = cameraState.flashEnabled;
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  // POST /api/camera/capture
+  server.on("/api/camera/capture", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (!cameraAvailable) {
+      server.send(503, "application/json", "{\"error\":\"camera not available\"}"); return;
+    }
+    server.send(200, "application/json", "{\"status\":\"captured\"}");
+  });
+
+  // POST /api/camera/stream/start
+  server.on("/api/camera/stream/start", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (!cameraAvailable) {
+      server.send(503, "application/json", "{\"error\":\"camera not available\"}"); return;
+    }
+    cameraState.streaming = true;
+    server.send(200, "application/json", "{\"status\":\"streaming\"}");
+  });
+
+  // POST /api/camera/stream/stop
+  server.on("/api/camera/stream/stop", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    cameraState.streaming = false;
+    server.send(200, "application/json", "{\"status\":\"stopped\"}");
   });
 }

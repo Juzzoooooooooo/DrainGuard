@@ -112,21 +112,19 @@ export class DrainGuardApi {
   }
 
   async getCameraStreamUrl() {
-    const result = await this.request<{
-      stream_url?: string;
-      available?: boolean;
-    }>('/api/camera/stream');
-
-    // No ESP32-CAM connected — return empty string, camera screen handles it
-    if (result.available === false || !result.stream_url) {
+    // ESP32-CAM streams directly at its static IP — no API call needed
+    // First verify it's reachable via the main controller's camera status
+    try {
+      const result = await this.request<{camera_available?: boolean}>(
+        '/api/camera/status',
+      );
+      if (result.camera_available === false) {
+        return '';
+      }
+    } catch {
       return '';
     }
-
-    const streamUrl = result.stream_url?.trim();
-    if (!streamUrl || !/^https?:\/\/[^\s]+$/i.test(streamUrl)) {
-      return '';
-    }
-
-    return streamUrl;
+    // Return the direct MJPEG stream URL from the ESP32-CAM
+    return 'http://192.168.4.50/stream';
   }
 }

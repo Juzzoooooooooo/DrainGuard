@@ -1,692 +1,230 @@
-import React, {useEffect, useRef, useState} from 'react';
+/**
+ * WiFi Hotspot Connection Instructions (Hotspot-Only Version)
+ * Replaces the old BLE provisioning component.
+ * Shows hotspot SSID/password and tests HTTP connection.
+ */
+
+import React, {useCallback, useEffect, useState} from 'react';
 import {
   ActivityIndicator,
-  Pressable,
   StyleSheet,
   Text,
-  TextInput,
+  TouchableOpacity,
   View,
 } from 'react-native';
 
-import {
-  bleProvisioning,
-  DrainGuardBleDevice,
-  DrainGuardProvisioningStatus,
-  DrainGuardWifiNetwork,
-} from '../services/bleProvisioning';
+import httpAPI from '../services/httpAPI';
 import {colors, radii, spacing} from '../theme';
 import type {ToastKind} from '../types';
-import {ActionButton} from './ActionButton';
-import {Card} from './Card';
 
 interface WifiProvisioningProps {
   notify: (message: string, kind?: ToastKind) => void;
   onProvisioned: (deviceIp: string) => Promise<void>;
-  onForgetWifi?: () => Promise<void>;
+  onForgetWifi: () => Promise<void>;
 }
 
-const DEVICE_SCAN_TIMEOUT_MS = 12500;
-const WIFI_SETUP_TIMEOUT_MS = 35000;
-const FORGET_WIFI_TIMEOUT_MS = 5000;
-const DEFAULT_HOTSPOT_IP = '192.168.4.1';
+export function WifiProvisioning({notify, onProvisioned}: WifiProvisioningProps) {
+  const [testing, setTesting] = useState(false);
+  const [connected, setConnected] = useState(false);
 
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : 'Bluetooth operation failed.';
-}
-
-function signalLabel(rssi: number) {
-  if (rssi >= -60) {
-    return 'Strong';
-  }
-  if (rssi >= -75) {
-    return 'Good';
-  }
-  return 'Weak';
-}
-
-export function WifiProvisioning({
-  notify,
-  onProvisioned,
-  onForgetWifi,
-}: WifiProvisioningProps) {
-  const [devices, setDevices] = useState<DrainGuardBleDevice[]>([]);
-  const [selectedDevice, setSelectedDevice] =
-    useState<DrainGuardBleDevice | null>(null);
-  const [connectingId, setConnectingId] = useState<string | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [wifiScanning, setWifiScanning] = useState(false);
-  const [networks, setNetworks] = useState<DrainGuardWifiNetwork[]>([]);
-  const [ssid, setSsid] = useState('');
-  const [password, setPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
-  const [provisioning, setProvisioning] = useState(false);
-  const [forgettingWifi, setForgettingWifi] = useState(false);
-  const [statusMessage, setStatusMessage] = useState(
-    'Scan for your DrainGuard controller to begin.',
-  );
-  const [connectedWifi, setConnectedWifi] = useState<{
-    ssid: string;
-    ip?: string;
-  } | null>(null);
-  const deviceScanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const wifiSetupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const forgetWifiTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const provisioningActive = useRef(false);
-  const onProvisionedRef = useRef(onProvisioned);
-  const onForgetWifiRef = useRef(onForgetWifi);
-
+  // Auto-test on mount
   useEffect(() => {
-    onProvisionedRef.current = onProvisioned;
-    onForgetWifiRef.current = onForgetWifi;
-  }, [onForgetWifi, onProvisioned]);
-
-  useEffect(() => {
-    const deviceSubscription = bleProvisioning.onDevice(device => {
-      setDevices(current => {
-        const withoutDevice = current.filter(item => item.id !== device.id);
-        return [...withoutDevice, device].sort(
-          (left, right) => right.rssi - left.rssi,
-        );
-      });
-    });
-    const stateSubscription = bleProvisioning.onState(state => {
-      setStatusMessage(state.message);
-      if (state.state === 'scanning') {
-        setScanning(true);
-      }
-      if (state.state === 'connected') {
-        setConnectingId(null);
-      }
-      if (state.state === 'disconnected') {
-        setConnectingId(null);
-        setSelectedDevice(null);
-        setWifiScanning(false);
-      }
-      if (state.state === 'error') {
-        setScanning(false);
-        notify(state.message, 'danger');
-      }
-    });
-    const statusSubscription = bleProvisioning.onStatus(
-      handleProvisioningStatus,
-    );
-
-    return () => {
-      deviceSubscription.remove();
-      stateSubscription.remove();
-      statusSubscription.remove();
-      if (deviceScanTimer.current) {
-        clearTimeout(deviceScanTimer.current);
-      }
-      if (wifiSetupTimer.current) {
-        clearTimeout(wifiSetupTimer.current);
-      }
-      if (forgetWifiTimer.current) {
-        clearTimeout(forgetWifiTimer.current);
-      }
-      bleProvisioning.stopScan().catch(() => undefined);
-      bleProvisioning.disconnect().catch(() => undefined);
-    };
-    // Subscriptions remain stable for this screen's lifetime.
+    testConnection(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleProvisioningStatus = (status: DrainGuardProvisioningStatus) => {
-    if (status.status === 'network' && status.ssid) {
-      const network: DrainGuardWifiNetwork = {
-        ssid: status.ssid,
-        rssi: status.rssi ?? -100,
-        secure: status.secure ?? true,
-      };
-      setNetworks(current => {
-        const withoutNetwork = current.filter(
-          item => item.ssid !== network.ssid,
-        );
-        return [...withoutNetwork, network].sort(
-          (left, right) => right.rssi - left.rssi,
-        );
-      });
-      return;
-    }
-
-    if (status.status === 'scanning_wifi') {
-      setWifiScanning(true);
-      setStatusMessage('DrainGuard is scanning nearby 2.4 GHz Wi-Fi networks.');
-      return;
-    }
-    if (status.status === 'scan_complete') {
-      setWifiScanning(false);
-      setStatusMessage('Choose a Wi-Fi network or enter its name manually.');
-      return;
-    }
-    if (status.status === 'connecting') {
-      setProvisioning(true);
-      setStatusMessage(`Connecting DrainGuard to ${status.ssid ?? 'Wi-Fi'}…`);
-      return;
-    }
-    if (status.status === 'connected') {
-      setProvisioning(false);
-      provisioningActive.current = false;
-      if (wifiSetupTimer.current) {
-        clearTimeout(wifiSetupTimer.current);
-      }
-      setConnectedWifi({ssid: status.ssid ?? ssid, ip: status.ip});
-      setStatusMessage(
-        `Internet connected${status.ip ? ` — ${status.ip}` : ''}`,
-      );
-      if (status.ssid) {
-        notify(`DrainGuard connected to ${status.ssid}.`, 'success');
-      }
-      // The station IP is only for the optional internet uplink. Camera and
-      // arm controls must continue through the private robot hotspot.
-      const localControlIp = status.hotspot_ip ?? DEFAULT_HOTSPOT_IP;
-      onProvisionedRef.current(localControlIp).catch(() => undefined);
-      return;
-    }
-    if (status.status === 'forgotten') {
-      setForgettingWifi(false);
-      if (forgetWifiTimer.current) {
-        clearTimeout(forgetWifiTimer.current);
-        forgetWifiTimer.current = null;
-      }
-      setConnectedWifi(null);
-      setSsid('');
-      setPassword('');
-      setStatusMessage(
-        'Saved Wi-Fi cleared. The private DrainGuard hotspot is still active.',
-      );
-      onForgetWifiRef.current?.().catch(() => undefined);
-      notify('Saved Wi-Fi credentials cleared.', 'success');
-      return;
-    }
-    if (status.status === 'failed') {
-      setProvisioning(false);
-      provisioningActive.current = false;
-      if (wifiSetupTimer.current) {
-        clearTimeout(wifiSetupTimer.current);
-      }
-      const reason =
-        status.reason === 'authentication_failed'
-          ? 'Check the Wi-Fi password.'
-          : status.message ?? 'DrainGuard could not join that Wi-Fi network.';
-      setStatusMessage(reason);
-      notify(reason, 'danger');
-      return;
-    }
-    if (
-      status.status === 'invalid' ||
-      status.status === 'busy' ||
-      status.status === 'scan_failed' ||
-      status.status === 'clear_failed' ||
-      status.status === 'error'
-    ) {
-      setWifiScanning(false);
-      setProvisioning(false);
-      setForgettingWifi(false);
-      if (forgetWifiTimer.current) {
-        clearTimeout(forgetWifiTimer.current);
-        forgetWifiTimer.current = null;
-      }
-      const message =
-        status.message ?? 'DrainGuard rejected the setup request.';
-      setStatusMessage(message);
-      notify(message, 'danger');
-    }
-  };
-
-  const scanForDevices = async () => {
-    setDevices([]);
-    setSelectedDevice(null);
-    setConnectedWifi(null);
-    setScanning(true);
-    setStatusMessage('Looking for DrainGuard controllers…');
-    try {
-      await bleProvisioning.startScan();
-      if (deviceScanTimer.current) {
-        clearTimeout(deviceScanTimer.current);
-      }
-      deviceScanTimer.current = setTimeout(() => {
-        setScanning(false);
-        setStatusMessage(current =>
-          current.startsWith('Looking')
-            ? 'Scan complete. Select a DrainGuard controller.'
-            : current,
-        );
-      }, DEVICE_SCAN_TIMEOUT_MS);
-    } catch (error) {
-      setScanning(false);
-      const message = errorMessage(error);
-      setStatusMessage(message);
-      notify(message, 'warning');
-    }
-  };
-
-  const scanWifiNetworks = async () => {
-    setNetworks([]);
-    setWifiScanning(true);
-    setStatusMessage('Asking DrainGuard to scan nearby Wi-Fi…');
-    try {
-      await bleProvisioning.scanWifi();
-    } catch (error) {
-      setWifiScanning(false);
-      const message = errorMessage(error);
-      setStatusMessage(message);
-      notify(message, 'danger');
-    }
-  };
-
-  const connectDevice = async (device: DrainGuardBleDevice) => {
-    setConnectingId(device.id);
-    setStatusMessage(`Connecting to ${device.name}…`);
-    try {
-      await bleProvisioning.connect(device.id);
-      setSelectedDevice(device);
-      setScanning(false);
-      notify(`${device.name} connected by Bluetooth.`, 'success');
-      await scanWifiNetworks();
-    } catch (error) {
-      setConnectingId(null);
-      const message = errorMessage(error);
-      setStatusMessage(message);
-      notify(message, 'danger');
-    }
-  };
-
-  const connectWifi = async () => {
-    const cleanSsid = ssid.trim();
-    if (!cleanSsid || cleanSsid.length > 32) {
-      notify('Enter a Wi-Fi name between 1 and 32 characters.', 'warning');
-      return;
-    }
-    if (password.length > 63) {
-      notify('Wi-Fi password cannot exceed 63 characters.', 'warning');
-      return;
-    }
-
-    provisioningActive.current = true;
-    setConnectedWifi(null);
-    setProvisioning(true);
-    setStatusMessage(`Sending ${cleanSsid} credentials…`);
-    try {
-      await bleProvisioning.provisionWifi(cleanSsid, password);
-      wifiSetupTimer.current = setTimeout(() => {
-        if (!provisioningActive.current) {
-          return;
+  const testConnection = useCallback(
+    async (showToast = true) => {
+      setTesting(true);
+      try {
+        const ok = await httpAPI.testConnection();
+        setConnected(ok);
+        if (ok) {
+          await onProvisioned('192.168.4.1');
+          if (showToast) notify('Connected to DrainGuard!', 'success');
+        } else {
+          if (showToast)
+            notify(
+              'Not connected. Join DrainGuard-Robot WiFi first.',
+              'danger',
+            );
         }
-        provisioningActive.current = false;
-        setProvisioning(false);
-        setStatusMessage(
-          'Wi-Fi setup timed out. Check the credentials and retry.',
-        );
-        notify('Wi-Fi setup timed out.', 'danger');
-      }, WIFI_SETUP_TIMEOUT_MS);
-    } catch (error) {
-      provisioningActive.current = false;
-      setProvisioning(false);
-      const message = errorMessage(error);
-      setStatusMessage(message);
-      notify(message, 'danger');
-    }
-  };
-
-  const forgetWifi = async () => {
-    setForgettingWifi(true);
-    setStatusMessage('Clearing saved Wi-Fi credentials…');
-    if (forgetWifiTimer.current) {
-      clearTimeout(forgetWifiTimer.current);
-    }
-    forgetWifiTimer.current = setTimeout(() => {
-      setForgettingWifi(false);
-      setStatusMessage(
-        'DrainGuard did not confirm that the saved Wi-Fi was cleared.',
-      );
-      notify(
-        'Forget Wi-Fi timed out. Reconnect by Bluetooth and retry.',
-        'danger',
-      );
-    }, FORGET_WIFI_TIMEOUT_MS);
-    try {
-      await bleProvisioning.forgetWifi();
-    } catch (error) {
-      if (forgetWifiTimer.current) {
-        clearTimeout(forgetWifiTimer.current);
-        forgetWifiTimer.current = null;
+      } catch {
+        setConnected(false);
+        if (showToast)
+          notify('Connection error. Check your WiFi.', 'danger');
+      } finally {
+        setTesting(false);
       }
-      setForgettingWifi(false);
-      const message = errorMessage(error);
-      setStatusMessage(message);
-      notify(message, 'danger');
-    }
-  };
+    },
+    [notify, onProvisioned],
+  );
 
   return (
-    <Card icon="⌁" title="Bluetooth Wi-Fi Setup">
-      <View
-        style={[
-          styles.statusPanel,
-          connectedWifi ? styles.statusPanelSuccess : null,
-        ]}>
-        <View
-          style={[
-            styles.statusDot,
-            connectedWifi ? styles.statusDotSuccess : null,
-          ]}
-        />
-        <Text style={styles.statusText}>{statusMessage}</Text>
+    <View style={styles.card}>
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.icon}>📡</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.title}>WiFi Connection</Text>
+          <Text style={styles.subtitle}>
+            Connect your phone to the DrainGuard hotspot
+          </Text>
+        </View>
       </View>
 
-      <Text style={styles.stepLabel}>1. CONNECT TO DRAINGUARD</Text>
-      <Text style={styles.description}>
-        Keep the robot powered on and nearby while the Bluetooth connection is
-        established.
-      </Text>
-      <ActionButton
-        disabled={scanning || connectingId !== null}
-        icon="⌁"
-        label={scanning ? 'Scanning…' : 'Scan for DrainGuard'}
-        onPress={scanForDevices}
-      />
-
-      {devices.map(device => {
-        const connecting = connectingId === device.id;
-        const selected = selectedDevice?.id === device.id;
-        return (
-          <Pressable
-            accessibilityRole="button"
-            disabled={connectingId !== null || selected}
-            key={device.id}
-            onPress={() => connectDevice(device)}
-            style={({pressed}) => [
-              styles.deviceRow,
-              selected && styles.deviceRowSelected,
-              pressed && styles.rowPressed,
-            ]}>
-            <View style={styles.deviceCopy}>
-              <Text style={styles.deviceName}>{device.name}</Text>
-              <Text style={styles.deviceMeta}>
-                {signalLabel(device.rssi)} signal · {device.id}
-              </Text>
-            </View>
-            {connecting ? (
-              <ActivityIndicator color={colors.primary} size="small" />
-            ) : (
-              <Text style={styles.connectLabel}>
-                {selected ? 'CONNECTED' : 'CONNECT'}
-              </Text>
-            )}
-          </Pressable>
-        );
-      })}
-
-      {selectedDevice ? (
-        <View style={styles.wifiSection}>
-          <View style={styles.stepHeadingRow}>
-            <Text style={styles.stepLabel}>2. ENTER WI-FI CREDENTIALS</Text>
-            <Pressable
-              accessibilityRole="button"
-              disabled={wifiScanning}
-              onPress={scanWifiNetworks}>
-              <Text style={styles.rescanText}>
-                {wifiScanning ? 'SCANNING…' : 'RESCAN WI-FI'}
-              </Text>
-            </Pressable>
+      {/* Instructions */}
+      <View style={styles.steps}>
+        <View style={styles.stepRow}>
+          <View style={styles.stepNum}>
+            <Text style={styles.stepNumText}>1</Text>
           </View>
-          <Text style={styles.description}>
-            DrainGuard supports 2.4 GHz Wi-Fi networks.
+          <Text style={styles.stepText}>
+            Open your phone's <Text style={styles.bold}>WiFi Settings</Text>
           </Text>
-
-          {networks.length > 0 ? (
-            <View style={styles.networkList}>
-              {networks.slice(0, 8).map(network => (
-                <Pressable
-                  accessibilityRole="button"
-                  key={network.ssid}
-                  onPress={() => setSsid(network.ssid)}
-                  style={({pressed}) => [
-                    styles.networkRow,
-                    ssid === network.ssid && styles.networkRowSelected,
-                    pressed && styles.rowPressed,
-                  ]}>
-                  <View style={styles.networkCopy}>
-                    <Text style={styles.networkName}>{network.ssid}</Text>
-                    <Text style={styles.networkMeta}>
-                      {network.secure ? 'Secured' : 'Open'} ·{' '}
-                      {signalLabel(network.rssi)} signal
-                    </Text>
-                  </View>
-                  <Text style={styles.networkSelect}>
-                    {ssid === network.ssid ? '✓' : '›'}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          ) : null}
-
-          <Text style={styles.inputLabel}>Wi-Fi name (SSID)</Text>
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            maxLength={32}
-            onChangeText={setSsid}
-            placeholder="Home Wi-Fi"
-            placeholderTextColor="#A0A3AA"
-            style={styles.input}
-            value={ssid}
-          />
-
-          <Text style={styles.inputLabel}>Wi-Fi password</Text>
-          <View style={styles.passwordRow}>
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              maxLength={63}
-              onChangeText={setPassword}
-              placeholder="Enter password"
-              placeholderTextColor="#A0A3AA"
-              secureTextEntry={!showPassword}
-              style={styles.passwordInput}
-              value={password}
-            />
-            <Pressable
-              accessibilityRole="button"
-              onPress={() => setShowPassword(current => !current)}
-              style={styles.showButton}>
-              <Text style={styles.showText}>
-                {showPassword ? 'HIDE' : 'SHOW'}
-              </Text>
-            </Pressable>
-          </View>
-
-          <ActionButton
-            disabled={provisioning || !ssid.trim()}
-            icon="⌁"
-            label={
-              provisioning ? 'Connecting to Internet…' : 'Connect DrainGuard'
-            }
-            onPress={connectWifi}
-            variant="success"
-          />
         </View>
-      ) : null}
 
-      <Pressable
-        accessibilityRole="button"
-        onPress={() =>
-          bleProvisioning.openBluetoothSettings().catch(() => undefined)
-        }
-        style={styles.settingsLink}>
-        <Text style={styles.settingsLinkText}>
-          OPEN PHONE BLUETOOTH SETTINGS
-        </Text>
-      </Pressable>
+        <View style={styles.stepRow}>
+          <View style={styles.stepNum}>
+            <Text style={styles.stepNumText}>2</Text>
+          </View>
+          <View>
+            <Text style={styles.stepText}>
+              Connect to:{' '}
+              <Text style={styles.ssid}>DrainGuard-Robot</Text>
+            </Text>
+            <Text style={styles.stepText}>
+              Password:{' '}
+              <Text style={styles.bold}>DrainGuard123</Text>
+            </Text>
+          </View>
+        </View>
 
-      {onForgetWifi && selectedDevice ? (
-        <Pressable
-          accessibilityRole="button"
-          disabled={forgettingWifi || provisioning || wifiScanning}
-          onPress={forgetWifi}
-          style={styles.settingsLink}>
-          <Text style={[styles.settingsLinkText, styles.forgetText]}>
-            {forgettingWifi ? 'FORGETTING…' : 'FORGET SAVED WI-FI'}
+        <View style={styles.stepRow}>
+          <View style={styles.stepNum}>
+            <Text style={styles.stepNumText}>3</Text>
+          </View>
+          <Text style={styles.stepText}>
+            Return here and tap <Text style={styles.bold}>Test Connection</Text>
           </Text>
-        </Pressable>
-      ) : null}
-    </Card>
+        </View>
+      </View>
+
+      {/* Status */}
+      {connected && (
+        <View style={styles.connectedBadge}>
+          <Text style={styles.connectedText}>✅  Connected to DrainGuard</Text>
+        </View>
+      )}
+
+      {/* Button */}
+      <TouchableOpacity
+        disabled={testing}
+        onPress={() => testConnection(true)}
+        style={[styles.button, testing && styles.buttonDisabled]}>
+        {testing ? (
+          <ActivityIndicator color="#fff" size="small" />
+        ) : (
+          <Text style={styles.buttonText}>
+            {connected ? 'Re-test Connection' : 'Test Connection'}
+          </Text>
+        )}
+      </TouchableOpacity>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  statusPanel: {
-    minHeight: 48,
+  card: {
+    backgroundColor: colors.page,
+    borderRadius: radii.md,
+    borderWidth: 1.5,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    marginBottom: spacing.lg,
+  },
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: radii.sm,
-    backgroundColor: colors.primarySoft,
-    paddingHorizontal: spacing.md,
-    marginBottom: spacing.xl,
+    marginBottom: spacing.lg,
   },
-  statusPanelSuccess: {backgroundColor: colors.successSoft},
-  statusDot: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-    backgroundColor: colors.primary,
-    marginRight: spacing.sm,
+  icon: {
+    fontSize: 28,
+    marginRight: spacing.md,
   },
-  statusDotSuccess: {backgroundColor: colors.success},
-  statusText: {
-    flex: 1,
+  headerText: {flex: 1},
+  title: {
     color: colors.text,
-    fontSize: 12,
-    lineHeight: 17,
-    fontWeight: '600',
-  },
-  stepLabel: {
-    color: colors.primary,
-    fontSize: 10,
+    fontSize: 16,
     fontWeight: '800',
-    letterSpacing: 1,
   },
-  description: {
+  subtitle: {
     color: colors.textMuted,
     fontSize: 12,
-    lineHeight: 18,
-    marginTop: spacing.xs,
+    marginTop: 2,
+  },
+  steps: {
+    marginBottom: spacing.lg,
+    gap: spacing.md,
+  },
+  stepRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+  },
+  stepNum: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 1,
+  },
+  stepNumText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  stepText: {
+    color: colors.textMuted,
+    fontSize: 13,
+    lineHeight: 20,
+    flex: 1,
+  },
+  bold: {
+    color: colors.text,
+    fontWeight: '700',
+  },
+  ssid: {
+    color: colors.primary,
+    fontWeight: '800',
+  },
+  connectedBadge: {
+    backgroundColor: '#E8F5E9',
+    borderRadius: radii.sm,
+    padding: spacing.md,
+    alignItems: 'center',
     marginBottom: spacing.md,
   },
-  deviceRow: {
-    minHeight: 58,
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radii.sm,
-    backgroundColor: colors.inset,
-    paddingHorizontal: spacing.md,
-    marginTop: spacing.sm,
-  },
-  deviceRowSelected: {
-    borderColor: colors.success,
-    backgroundColor: colors.successSoft,
-  },
-  rowPressed: {opacity: 0.7},
-  deviceCopy: {flex: 1},
-  deviceName: {color: colors.text, fontSize: 14, fontWeight: '700'},
-  deviceMeta: {color: colors.textMuted, fontSize: 10, marginTop: 3},
-  connectLabel: {
-    color: colors.primary,
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-  },
-  wifiSection: {
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    marginTop: spacing.xl,
-    paddingTop: spacing.xl,
-  },
-  stepHeadingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  rescanText: {
-    color: colors.primary,
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-  },
-  networkList: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radii.sm,
-    overflow: 'hidden',
-    marginBottom: spacing.lg,
-  },
-  networkRow: {
-    minHeight: 48,
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-    backgroundColor: colors.card,
-    paddingHorizontal: spacing.md,
-  },
-  networkRowSelected: {backgroundColor: colors.primarySoft},
-  networkCopy: {flex: 1},
-  networkName: {color: colors.text, fontSize: 13, fontWeight: '700'},
-  networkMeta: {color: colors.textMuted, fontSize: 10, marginTop: 2},
-  networkSelect: {color: colors.primary, fontSize: 20, fontWeight: '700'},
-  inputLabel: {
-    color: colors.text,
-    fontSize: 12,
+  connectedText: {
+    color: '#2E7D32',
+    fontSize: 14,
     fontWeight: '700',
-    marginBottom: 6,
   },
-  input: {
-    height: 48,
-    borderWidth: 1.5,
-    borderColor: colors.border,
+  button: {
+    backgroundColor: colors.primary,
     borderRadius: radii.sm,
-    backgroundColor: colors.inset,
-    color: colors.text,
-    fontSize: 14,
-    paddingHorizontal: spacing.md,
-    marginBottom: spacing.lg,
-  },
-  passwordRow: {
     height: 48,
-    flexDirection: 'row',
-    borderWidth: 1.5,
-    borderColor: colors.border,
-    borderRadius: radii.sm,
-    backgroundColor: colors.inset,
-    overflow: 'hidden',
-    marginBottom: spacing.lg,
-  },
-  passwordInput: {
-    flex: 1,
-    color: colors.text,
-    fontSize: 14,
-    paddingHorizontal: spacing.md,
-  },
-  showButton: {
+    alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: spacing.md,
   },
-  showText: {color: colors.primary, fontSize: 10, fontWeight: '800'},
-  settingsLink: {
-    alignSelf: 'center',
-    marginTop: spacing.lg,
-    padding: spacing.sm,
+  buttonDisabled: {
+    opacity: 0.6,
   },
-  settingsLinkText: {
-    color: colors.textMuted,
-    fontSize: 9,
+  buttonText: {
+    color: '#fff',
+    fontSize: 15,
     fontWeight: '700',
-    letterSpacing: 0.6,
-  },
-  forgetText: {
-    color: colors.danger,
   },
 });

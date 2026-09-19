@@ -16,7 +16,7 @@ import {CameraScreen} from './src/screens/CameraScreen';
 import {DashboardScreen} from './src/screens/DashboardScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {DrainGuardApi} from './src/services/api';
-import {bleController} from './src/services/bleController';
+import httpAPI from './src/services/httpAPI';
 import {
   loadSettings as loadSavedSettings,
   saveSettings as persistSettings,
@@ -64,106 +64,42 @@ function App() {
 
   useEffect(() => {
     let mounted = true;
-
     loadSavedSettings()
       .then(savedSettings => {
-        if (mounted) {
-          setSettings(savedSettings);
-        }
+        if (mounted) setSettings(savedSettings);
       })
       .catch(() => {
-        if (mounted) {
-          notify('Saved settings could not be loaded.', 'warning');
-        }
+        if (mounted) notify('Saved settings could not be loaded.', 'warning');
       })
       .finally(() => {
-        if (mounted) {
-          setReady(true);
-        }
+        if (mounted) setReady(true);
       });
-
-    return () => {
-      mounted = false;
-    };
+    return () => { mounted = false; };
   }, [notify]);
 
   useEffect(() => {
-    let mounted = true;
-    const subscription = bleController.onConnectionState(state => {
-      if (!mounted) {
-        return;
-      }
-      if (state === 'connected') {
-        setConnected(true);
-      } else if (state === 'disconnected' || state === 'error') {
-        setConnected(false);
-      } else if (
-        state === 'connecting' ||
-        state === 'reconnecting' ||
-        state === 'pairing' ||
-        state === 'discovering'
-      ) {
-        setConnected(null);
-      }
-    });
-
-    bleController
-      .isConnected()
-      .then(isConnected => {
-        if (!mounted) {
-          return;
-        }
-        if (isConnected) {
-          setConnected(true);
-          return;
-        }
-        return bleController.reconnectLast();
-      })
-      .catch(() => {
-        if (mounted) {
-          setConnected(false);
-        }
-      });
-
-    return () => {
-      mounted = false;
-      subscription.remove();
-    };
-  }, []);
-
-  useEffect(() => {
     screenMode?.setCameraMode?.(cameraMode);
-
-    return () => {
-      if (cameraMode) {
-        screenMode?.setCameraMode?.(false);
-      }
-    };
+    return () => { if (cameraMode) screenMode?.setCameraMode?.(false); };
   }, [cameraMode]);
 
   useEffect(() => {
-    if (!cameraMode) {
-      return;
-    }
-
+    if (!cameraMode) return;
     const subscription = BackHandler.addEventListener(
       'hardwareBackPress',
-      () => {
-        setActiveTab('dashboard');
-        return true;
-      },
+      () => { setActiveTab('dashboard'); return true; },
     );
-
     return () => subscription.remove();
   }, [cameraMode]);
 
+  // Poll status via HTTP
   const refreshStatus = useCallback(async () => {
     try {
-      const nextStatus = await bleController.getSystemStatus();
+      const nextStatus = await httpAPI.getStatus() as unknown as SystemStatus;
       setStatus(nextStatus);
       setConnected(true);
       return true;
     } catch {
+      setConnected(false);
       return false;
     }
   }, []);
@@ -172,37 +108,33 @@ function App() {
     setRefreshing(true);
     const succeeded = await refreshStatus();
     setRefreshing(false);
-
     if (!succeeded) {
-      notify('Connect the DrainGuard controller by Bluetooth.', 'danger');
+      notify('Cannot reach DrainGuard. Connect to DrainGuard-Robot WiFi.', 'danger');
     }
   }, [notify, refreshStatus]);
 
   useEffect(() => {
-    if (!ready) {
-      return;
-    }
-
-    // Start polling immediately and keep it running across tab switches.
-    // Switching tabs no longer resets the interval.
+    if (!ready) return;
     refreshStatus();
     const interval = setInterval(
       refreshStatus,
       Math.max(settings.refreshRate, 1) * 1000,
     );
-
     return () => clearInterval(interval);
   }, [ready, refreshStatus, settings.refreshRate]);
 
+  // Arm control via HTTP
   const controlArm = useCallback(
     async (action: 'open' | 'close') => {
       try {
-        await bleController.controlArm(action);
+        if (action === 'open') {
+          await httpAPI.armOpen();
+        } else {
+          await httpAPI.armClose();
+        }
         setConnected(true);
         notify(`Arm ${action} command sent.`, 'success');
       } catch (error) {
-        // Don't flip connection state on arm command failure — arm sequences
-        // take up to 15s and a timeout doesn't mean the device is offline.
         notify(`Failed to run the arm ${action} action.`, 'danger');
         throw error;
       }
@@ -210,14 +142,19 @@ function App() {
     [notify],
   );
 
+  // Servo control via HTTP
   const controlServo = useCallback(
     async (servo: keyof ServoPositions, position: number) => {
       try {
-        await bleController.controlServo(servo, position);
+        const pos = Math.round(position);
+        switch (servo) {
+          case 'base':     await httpAPI.moveBase(pos);     break;
+          case 'shoulder': await httpAPI.moveShoulder(pos); break;
+          case 'elbow':    await httpAPI.moveElbow(pos);    break;
+          case 'gripper':  await httpAPI.moveGripper(pos);  break;
+        }
         setConnected(true);
       } catch (error) {
-        // Joystick sends many commands rapidly; the next BLE command can
-        // recover without changing the controller connection indicator.
         throw error;
       }
     },
@@ -255,10 +192,7 @@ function App() {
   );
 
   const useHotspotDeviceIp = useCallback(async () => {
-    const nextSettings = {
-      ...settings,
-      deviceIp: DEFAULT_SETTINGS.deviceIp,
-    };
+    const nextSettings = {...settings, deviceIp: DEFAULT_SETTINGS.deviceIp};
     await persistSettings(nextSettings);
     setSettings(nextSettings);
   }, [settings]);
@@ -321,7 +255,6 @@ function App() {
           )}
         </View>
       </View>
-
       {toastView}
     </SafeAreaView>
   );
