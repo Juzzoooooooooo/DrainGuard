@@ -21,6 +21,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -54,7 +55,6 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
       UUID.fromString("7b0d1003-5f6b-4c4f-9a7e-2f3b4d5e6f70");
   private static final UUID CLIENT_CONFIGURATION_UUID =
       UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-  private static final int SAFE_CHUNK_SIZE = 182;  // MTU 185 minus 3 bytes ATT overhead
   private static final int REQUESTED_MTU = 185;
   private static final long SCAN_DURATION_MS = 12000;
   private static final long CONNECTION_TIMEOUT_MS = 45000;
@@ -63,25 +63,32 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
   private static final long WRITE_RETRY_DELAY_MS = 200;
   private static final int MAX_CONNECTION_ATTEMPTS = 3;
   private static final int MAX_WRITE_START_ATTEMPTS = 8;
+  private static final String PREFERENCES_NAME = "drainguard_ble";
+  private static final String LAST_DEVICE_ADDRESS = "last_device_address";
 
   private final ReactApplicationContext reactContext;
   private final BluetoothAdapter bluetoothAdapter;
+  private final SharedPreferences preferences;
   private final Handler handler = new Handler(Looper.getMainLooper());
   private final Runnable scanTimeout = this::stopScanInternal;
   private final Set<String> discoveredDevices = new HashSet<>();
   private final ArrayDeque<byte[]> writeQueue = new ArrayDeque<>();
+  private final StringBuilder notificationBuffer = new StringBuilder();
 
   private BluetoothLeScanner scanner;
   private BluetoothGatt bluetoothGatt;
   private BluetoothGattCharacteristic commandCharacteristic;
   private BluetoothGattCharacteristic statusCharacteristic;
   private BluetoothDevice connectingDevice;
+  private BluetoothDevice activeDevice;
   private Promise connectionPromise;
   private Promise writePromise;
   private int connectionAttempt;
   private int writeStartAttempt;
+  private int negotiatedMtu = 23;
   private boolean scanning;
   private boolean ready;
+  private boolean manualDisconnect;
   private boolean serviceDiscoveryStarted;
   private boolean bondingRequested;
   private boolean notificationSetupStarted;
@@ -91,22 +98,39 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
       };
   private final Runnable reconnectGatt =
       () -> {
-        if (connectionPromise != null && connectingDevice != null && bluetoothGatt == null) {
+        if (connectingDevice != null && bluetoothGatt == null && !manualDisconnect) {
           startGattConnection(connectingDevice);
         }
       };
   private final Runnable writeRetry = this::writeNextChunk;
   private final Runnable connectionTimeout =
       () -> {
-        if (connectionPromise != null) {
-          rejectConnection("CONNECT_TIMEOUT", "Bluetooth connection or pairing timed out.");
-          closeGatt();
+        if (ready || bluetoothGatt == null || manualDisconnect) return;
+
+        BluetoothGatt timedOutGatt = bluetoothGatt;
+        BluetoothDevice retryDevice =
+            connectingDevice != null ? connectingDevice : activeDevice;
+        closeGattSession(timedOutGatt);
+
+        if (retryDevice != null && connectionAttempt < MAX_CONNECTION_ATTEMPTS) {
+          connectingDevice = retryDevice;
+          emitState("reconnecting", "Bluetooth connection timed out; retrying");
+          handler.removeCallbacks(reconnectGatt);
+          handler.postDelayed(reconnectGatt, RECONNECT_DELAY_MS);
+          return;
         }
+
+        rejectConnection("CONNECT_TIMEOUT", "Bluetooth connection or pairing timed out.");
+        activeDevice = null;
+        connectingDevice = null;
+        emitState("disconnected", "DrainGuard Bluetooth connection timed out");
+        closeGatt();
       };
 
   DrainGuardBleModule(ReactApplicationContext context) {
     super(context);
     reactContext = context;
+    preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE);
     BluetoothManager manager =
         (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
     bluetoothAdapter = manager == null ? null : manager.getAdapter();
@@ -190,7 +214,18 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
       return;
     }
 
+    if (
+        ready &&
+        activeDevice != null &&
+        activeDevice.getAddress().equalsIgnoreCase(deviceId)
+    ) {
+      promise.resolve(connectionResult(activeDevice));
+      return;
+    }
+
     stopScanInternal();
+    manualDisconnect = false;
+    activeDevice = null;
     closeGatt();
     BluetoothDevice device;
     try {
@@ -203,18 +238,99 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
     connectionPromise = promise;
     connectingDevice = device;
     connectionAttempt = 0;
-    handler.removeCallbacks(connectionTimeout);
-    handler.postDelayed(connectionTimeout, CONNECTION_TIMEOUT_MS);
     startGattConnection(device);
+  }
+
+  @SuppressLint("MissingPermission")
+  @ReactMethod
+  public void reconnectLast(Promise promise) {
+    if (ready && activeDevice != null) {
+      promise.resolve(connectionResult(activeDevice));
+      return;
+    }
+
+    String deviceId = preferences.getString(LAST_DEVICE_ADDRESS, "");
+    if (deviceId == null || deviceId.trim().isEmpty()) {
+      promise.reject("NO_SAVED_DEVICE", "Connect to a DrainGuard controller in Settings first.");
+      return;
+    }
+    connect(deviceId, promise);
+  }
+
+  @ReactMethod
+  public void isConnected(Promise promise) {
+    promise.resolve(ready);
   }
 
   @ReactMethod
   public void disconnect(Promise promise) {
     stopScanInternal();
+    manualDisconnect = true;
+    activeDevice = null;
     rejectConnection("DISCONNECTED", "DrainGuard Bluetooth disconnected.");
     closeGatt();
     emitState("disconnected", "Bluetooth disconnected");
     promise.resolve(null);
+  }
+
+  @ReactMethod
+  public void getControllerStatus(double requestId, Promise promise) {
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", "get_status");
+      payload.put("id", normalizeRequestId(requestId));
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException | IllegalArgumentException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create the status command.", error);
+    }
+  }
+
+  @ReactMethod
+  public void controlArm(String action, double requestId, Promise promise) {
+    if (!"open".equals(action) && !"close".equals(action)) {
+      promise.reject("INVALID_ACTION", "Arm action must be open or close.");
+      return;
+    }
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", "arm");
+      payload.put("action", action);
+      payload.put("id", normalizeRequestId(requestId));
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException | IllegalArgumentException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create the arm command.", error);
+    }
+  }
+
+  @ReactMethod
+  public void controlServo(
+      String servo,
+      double position,
+      double requestId,
+      Promise promise) {
+    if (
+        !"base".equals(servo) &&
+        !"shoulder".equals(servo) &&
+        !"elbow".equals(servo) &&
+        !"gripper".equals(servo)
+    ) {
+      promise.reject("INVALID_SERVO", "Unknown servo name.");
+      return;
+    }
+    if (!Double.isFinite(position) || position < 0 || position > 4095) {
+      promise.reject("INVALID_POSITION", "Servo position is invalid.");
+      return;
+    }
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", "servo");
+      payload.put("servo", servo);
+      payload.put("position", Math.round(position));
+      payload.put("id", normalizeRequestId(requestId));
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException | IllegalArgumentException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create the servo command.", error);
+    }
   }
 
   @ReactMethod
@@ -277,6 +393,39 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
     }
   }
 
+  @ReactMethod
+  public void sendCommand(String command, Promise promise) {
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", command);
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create command.", error);
+    }
+  }
+
+  @ReactMethod
+  public void configureHotspot(String ssid, String password, Promise promise) {
+    if (ssid == null || ssid.trim().isEmpty() || ssid.length() > 32) {
+      promise.reject("INVALID_SSID", "Hotspot SSID must be 1-32 characters.");
+      return;
+    }
+    if (password == null || password.length() < 8 || password.length() > 63) {
+      promise.reject("INVALID_PASSWORD", "Hotspot password must be 8-63 characters.");
+      return;
+    }
+
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("command", "hotspot_config");
+      payload.put("ssid", ssid.trim());
+      payload.put("password", password);
+      sendPayload(payload.toString(), promise);
+    } catch (JSONException error) {
+      promise.reject("COMMAND_ERROR", "Unable to create hotspot config command.", error);
+    }
+  }
+
   @SuppressLint("MissingPermission")
   private void stopScanInternal() {
     handler.removeCallbacks(scanTimeout);
@@ -294,6 +443,21 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
   private String safeDeviceName(BluetoothDevice device) {
     String name = device.getName();
     return name == null || name.trim().isEmpty() ? "DrainGuard" : name;
+  }
+
+  @SuppressLint("MissingPermission")
+  private WritableMap connectionResult(BluetoothDevice device) {
+    WritableMap result = Arguments.createMap();
+    result.putString("id", device.getAddress());
+    result.putString("name", safeDeviceName(device));
+    return result;
+  }
+
+  private long normalizeRequestId(double requestId) {
+    if (!Double.isFinite(requestId) || requestId < 1 || requestId > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("Controller request id is invalid.");
+    }
+    return Math.round(requestId);
   }
 
   private boolean advertisesDrainGuard(ScanResult result) {
@@ -392,7 +556,14 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
           }
           if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
             ready = false;
-            if (connectionPromise != null && connectionAttempt < MAX_CONNECTION_ATTEMPTS) {
+            BluetoothDevice retryDevice =
+                connectingDevice != null ? connectingDevice : activeDevice;
+            if (
+                !manualDisconnect &&
+                retryDevice != null &&
+                connectionAttempt < MAX_CONNECTION_ATTEMPTS
+            ) {
+              connectingDevice = retryDevice;
               closeGattSession(gatt);
               emitState("reconnecting", "Bluetooth was interrupted; retrying connection");
               handler.removeCallbacks(reconnectGatt);
@@ -402,16 +573,17 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
             rejectConnection(
                 "CONNECT_FAILED",
                 "DrainGuard Bluetooth connection failed (GATT " + status + "). Move closer and retry.");
+            activeDevice = null;
+            connectingDevice = null;
             emitState("disconnected", "DrainGuard disconnected");
             closeGatt();
             return;
           }
 
           if (newState == BluetoothProfile.STATE_CONNECTED) {
-            // The current firmware exposes unencrypted provisioning
-            // characteristics. Do not force an unnecessary Android bond here;
-            // encrypted firmware is still supported by the authentication
-            // recovery path used while enabling notifications and reading status.
+            // Service discovery can start before bonding. The encrypted status
+            // read below triggers Android's authentication recovery and pairing
+            // flow without depending on device-specific callback ordering.
             prepareGatt(gatt);
           }
         }
@@ -419,6 +591,9 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
           if (gatt != bluetoothGatt) return;
+          if (status == BluetoothGatt.GATT_SUCCESS && mtu >= 23) {
+            negotiatedMtu = mtu;
+          }
           handler.removeCallbacks(serviceDiscoveryFallback);
           discoverServices(gatt);
         }
@@ -514,7 +689,7 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
             int status) {
           if (!RX_UUID.equals(characteristic.getUuid())) return;
           if (status != BluetoothGatt.GATT_SUCCESS) {
-            rejectWrite("WRITE_FAILED", "DrainGuard did not accept the setup command.");
+            rejectWrite("WRITE_FAILED", "DrainGuard did not accept the Bluetooth command.");
             return;
           }
           // Start the next write after this callback returns. Some Android BLE
@@ -525,10 +700,12 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
 
   @SuppressLint("MissingPermission")
   private void startGattConnection(BluetoothDevice device) {
-    if (connectionPromise == null) return;
+    if (device == null || manualDisconnect) return;
 
     connectionAttempt++;
     resetGattState();
+    handler.removeCallbacks(connectionTimeout);
+    handler.postDelayed(connectionTimeout, CONNECTION_TIMEOUT_MS);
     emitState(
         connectionAttempt == 1 ? "connecting" : "reconnecting",
         (connectionAttempt == 1 ? "Connecting to " : "Retrying ") + safeDeviceName(device));
@@ -552,12 +729,14 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
       }
     } catch (RuntimeException error) {
       rejectConnection("CONNECT_FAILED", "Android could not start the Bluetooth connection.");
+      emitState("disconnected", "DrainGuard Bluetooth connection failed");
       closeGatt();
       return;
     }
 
     if (bluetoothGatt == null) {
       rejectConnection("CONNECT_FAILED", "Android could not create a Bluetooth connection.");
+      emitState("disconnected", "DrainGuard Bluetooth connection failed");
       closeGatt();
     }
   }
@@ -565,7 +744,7 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
   @SuppressLint("MissingPermission")
   private void prepareGatt(BluetoothGatt gatt) {
     if (gatt != bluetoothGatt || serviceDiscoveryStarted) return;
-    emitState("discovering", "Preparing secure Wi-Fi setup");
+    emitState("discovering", "Preparing secure DrainGuard controls");
     if (!gatt.requestMtu(REQUESTED_MTU)) {
       discoverServices(gatt);
       return;
@@ -640,19 +819,21 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
 
   @SuppressLint("MissingPermission")
   private void completeConnection(BluetoothGatt gatt) {
-    if (gatt != bluetoothGatt || connectionPromise == null) return;
+    if (gatt != bluetoothGatt) return;
 
     ready = true;
+    manualDisconnect = false;
     bondingRequested = false;
     handler.removeCallbacks(connectionTimeout);
     handler.removeCallbacks(reconnectGatt);
+    activeDevice = gatt.getDevice();
+    preferences.edit().putString(LAST_DEVICE_ADDRESS, activeDevice.getAddress()).apply();
     emitState("connected", "DrainGuard Bluetooth connected");
 
-    WritableMap result = Arguments.createMap();
-    result.putString("id", gatt.getDevice().getAddress());
-    result.putString("name", safeDeviceName(gatt.getDevice()));
-    connectionPromise.resolve(result);
-    connectionPromise = null;
+    if (connectionPromise != null) {
+      connectionPromise.resolve(connectionResult(activeDevice));
+      connectionPromise = null;
+    }
     connectingDevice = null;
     connectionAttempt = 0;
   }
@@ -701,9 +882,10 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
     }
 
     byte[] bytes = (payload + "\n").getBytes(StandardCharsets.UTF_8);
+    int chunkSize = Math.max(20, negotiatedMtu - 3);
     writeQueue.clear();
-    for (int offset = 0; offset < bytes.length; offset += SAFE_CHUNK_SIZE) {
-      int length = Math.min(SAFE_CHUNK_SIZE, bytes.length - offset);
+    for (int offset = 0; offset < bytes.length; offset += chunkSize) {
+      int length = Math.min(chunkSize, bytes.length - offset);
       byte[] chunk = new byte[length];
       System.arraycopy(bytes, offset, chunk, 0, length);
       writeQueue.add(chunk);
@@ -766,14 +948,35 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
     } else {
       rejectWrite(
           "WRITE_FAILED",
-          "Android Bluetooth stayed busy while sending the setup command. Reconnect to DrainGuard and retry.");
+          "Android Bluetooth stayed busy while sending the command. Reconnect to DrainGuard and retry.");
     }
   }
 
   private void emitStatus(byte[] value) {
     if (value == null || value.length == 0) return;
+    notificationBuffer.append(new String(value, StandardCharsets.UTF_8));
+
+    int delimiterIndex = notificationBuffer.indexOf("\n");
+    while (delimiterIndex >= 0) {
+      String payload = notificationBuffer.substring(0, delimiterIndex).trim();
+      notificationBuffer.delete(0, delimiterIndex + 1);
+      if (!payload.isEmpty()) emitStatusPayload(payload);
+      delimiterIndex = notificationBuffer.indexOf("\n");
+    }
+
+    // Older firmware sends one complete JSON notification without a newline.
+    String buffered = notificationBuffer.toString().trim();
+    if (buffered.startsWith("{") && buffered.endsWith("}")) {
+      notificationBuffer.setLength(0);
+      emitStatusPayload(buffered);
+    } else if (notificationBuffer.length() > 4096) {
+      notificationBuffer.setLength(0);
+    }
+  }
+
+  private void emitStatusPayload(String payload) {
     WritableMap event = Arguments.createMap();
-    event.putString("payload", new String(value, StandardCharsets.UTF_8));
+    event.putString("payload", payload);
     emit("DrainGuardBleStatus", event);
   }
 
@@ -815,6 +1018,7 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
     handler.removeCallbacks(serviceDiscoveryFallback);
     handler.removeCallbacks(reconnectGatt);
     connectingDevice = null;
+    activeDevice = null;
     connectionAttempt = 0;
     rejectWrite("DISCONNECTED", "DrainGuard Bluetooth disconnected.");
     if (bluetoothGatt != null) {
@@ -844,15 +1048,18 @@ public class DrainGuardBleModule extends ReactContextBaseJavaModule {
 
   private void resetGattState() {
     ready = false;
+    negotiatedMtu = 23;
     serviceDiscoveryStarted = false;
     bondingRequested = false;
     notificationSetupStarted = false;
     commandCharacteristic = null;
     statusCharacteristic = null;
+    notificationBuffer.setLength(0);
   }
 
   @Override
   public void invalidate() {
+    manualDisconnect = true;
     stopScanInternal();
     closeGatt();
     try {

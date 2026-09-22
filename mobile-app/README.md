@@ -9,8 +9,8 @@ React Native control panel for the Drain Guard ESP32 system. The interface mirro
 - GPS coordinates with one-tap Google Maps launch
 - ESP32-CAM stream with refresh and offline states
 - Arm quick actions, a touch joystick, hold-to-move elbow controls, and claw toggle
-- Persistent controller address, refresh rate, and warning thresholds
-- Support for the private `DrainGuard-Robot` hotspot at `192.168.4.1`
+- Persistent BLE controller connection with automatic reconnect across tabs
+- Optional `DrainGuard-Robot` hotspot access for the ESP32-CAM stream
 
 ## Install on Android
 
@@ -54,14 +54,14 @@ npm run ios
 
 ## Connect to the robot
 
-1. Connect the phone to the `DrainGuard-Robot` Wi-Fi network.
-2. Open Settings in the app.
-3. Keep the controller IP at `192.168.4.1` so both robot commands and camera access use the private hotspot.
-4. Save settings and return to the Dashboard.
+1. Power the ESP32 DevKit with the new BLE-controller firmware.
+2. Open **Settings**, tap **Scan for DrainGuard**, and select `DrainGuard-XXXX`.
+3. Accept the Android nearby-device and pairing prompts. Sensor status and arm controls now use the encrypted BLE connection, which the app remembers and reconnects automatically.
+4. To view the ESP32-CAM, connect the phone to `DrainGuard-Robot`. Keep the optional camera gateway at `192.168.4.1`; the app discovers the camera at `192.168.4.50`.
 
-The app uses unencrypted HTTP because it talks directly to the ESP32 on a private local network. Android cleartext traffic and iOS local-network access are enabled in the native project for this purpose.
+WiFi provisioning is optional and only provides the DevKit with an internet uplink. The app's controls and status do not require the phone to be on the robot hotspot. To remove saved uplink credentials, open Settings over BLE and tap **Forget Saved Wi-Fi**.
 
-Bluetooth provisioning gives the controller an optional internet uplink, but local controls and the ESP32-CAM continue to use the private hotspot. After provisioning, keep the phone on `DrainGuard-Robot` and keep the controller address at `192.168.4.1`. To remove the saved uplink, reconnect to the controller by Bluetooth and tap **Forget Saved Wi-Fi**.
+The current native BLE controller implementation is Android-only. The camera still uses local HTTP over WiFi because BLE is not suitable for live video.
 
 ## Checks
 

@@ -1,6 +1,8 @@
 # DrainGuard Bluetooth WiFi Provisioning
 
-DrainGuard uses Bluetooth Low Energy (BLE) GATT provisioning so the same workflow works on Android and iOS. The ESP32 advertises as `DrainGuard-XXXX`, where `XXXX` is the final four hexadecimal digits of its factory MAC address.
+DrainGuard uses Bluetooth Low Energy (BLE) GATT for Android controller commands, live status, and optional WiFi provisioning. The ESP32 advertises as `DrainGuard-XXXX`, where `XXXX` is the final four hexadecimal digits of its factory MAC address.
+
+The ESP32-CAM video stream remains on WiFi because BLE does not provide enough bandwidth for practical live video. The phone only needs to join `DrainGuard-Robot` when viewing the camera; arm controls and sensor status continue over BLE.
 
 ## Provisioning flow
 
@@ -11,13 +13,13 @@ DrainGuard uses Bluetooth Low Energy (BLE) GATT provisioning so the same workflo
 5. Enter the WiFi password and, optionally, a telemetry API endpoint.
 6. Tap **Configure WiFi**.
 7. The ESP32 reports `connecting`, followed by `connected` or `failed`. A connection attempt times out after 30 seconds.
-8. After success, the ESP32 stores the credentials in NVS. The app keeps using the private hotspot address for camera and arm controls; the password is never stored by the app.
+8. After success, the ESP32 stores the credentials in NVS. The app keeps the BLE controller connection active across tabs; the WiFi password is never stored by the app.
 
 If connection fails, BLE remains available and the user can correct the credentials and retry without rebooting or reflashing the ESP32.
 
 ## Relationship to the private hotspot
 
-BLE provisioning configures the DevKit's optional station-mode internet uplink. Independently, the DevKit maintains the `DrainGuard-Robot` private hotspot at `192.168.4.1`. The ESP32-CAM joins that hotspot at the fixed address `192.168.4.50`, and the phone can join it for router-free local control and video.
+BLE provisioning configures the DevKit's optional station-mode internet uplink. Independently, the DevKit maintains the `DrainGuard-Robot` private hotspot at `192.168.4.1`. The ESP32-CAM joins that hotspot at the fixed address `192.168.4.50`, and the phone can join it for router-free video. The HTTP robot API remains available for diagnostics and compatibility, but the Android app no longer depends on it for controls or status.
 
 The firmware uses `WIFI_AP_STA`, so an uplink connection or failed provisioning attempt does not turn off the private hotspot. Hotspot credentials are compile-time settings in `firmware/src/config.h` and must match the values in `firmware/esp32cam/esp32cam.ino`.
 
@@ -51,7 +53,22 @@ Credentials are committed only after `WL_CONNECTED`, so a failed provisioning at
 | Status characteristic | `7b0d1003-5f6b-4c4f-9a7e-2f3b4d5e6f70` (read/notify) |
 | Message encoding | UTF-8 JSON terminated by `\n` |
 
-The mobile app splits each JSON command into conservative 18-byte BLE chunks and terminates it with `\n`. The ESP32 reassembles chunks until the newline delimiter.
+The mobile app requests a larger MTU, splits each JSON command according to the negotiated payload size, and terminates it with `\n`. The ESP32 reassembles chunks until the newline delimiter. Status notifications use conservative 20-byte chunks and the same framing so they also work when a phone remains at the default 23-byte ATT MTU.
+
+Read controller status:
+
+```json
+{ "command": "get_status", "id": 1 }
+```
+
+Control the drain arm or an individual servo:
+
+```json
+{ "command": "arm", "action": "open", "id": 2 }
+{ "command": "servo", "servo": "base", "position": 90, "id": 3 }
+```
+
+Every control request carries an integer `id`. The firmware returns the same ID in either a compact `controller_status` notification or a `command_result`, allowing the app to match asynchronous BLE responses to the correct request.
 
 Configure WiFi:
 
@@ -93,6 +110,8 @@ Status notifications include:
 | `clear_failed` | Saved uplink credentials could not be cleared |
 | `invalid` | Malformed or invalid command |
 | `busy` | Command queue is full |
+| `controller_status` | Compact sensor, drain, and GPS state for a matching request `id` |
+| `command_result` | Acceptance or rejection of an arm/servo command for a matching request `id` |
 
 ## Mobile dependency installation
 
@@ -102,9 +121,7 @@ From `mobile-app`:
 npm install
 ```
 
-The app uses `react-native-ble-plx` and `buffer`. BLE requires a native build; it will not work in a JavaScript-only preview environment.
-
-This repository snapshot does not contain `android/` or `ios/` project directories. Apply the following settings after restoring or generating the React Native native projects.
+The Android app uses the repository's native `DrainGuardBleModule`; no third-party BLE package is required. BLE requires a native APK build and does not work in a JavaScript-only preview environment.
 
 ### Android
 
@@ -129,22 +146,7 @@ Android 12 and newer prompt for nearby-device scan/connect access. Android 11 an
 
 ### iOS
 
-Run CocoaPods after installing dependencies:
-
-```bash
-cd ios
-pod install
-cd ..
-```
-
-Add this key to `ios/DrainGuardApp/Info.plist`:
-
-```xml
-<key>NSBluetoothAlwaysUsageDescription</key>
-<string>DrainGuard uses Bluetooth to securely configure your robot's WiFi connection.</string>
-```
-
-Background BLE mode is not required because provisioning runs while the setup screen is open.
+The persistent BLE controller module in this repository is currently Android-only. An equivalent CoreBluetooth native module is required before the same controller path can be used on iOS.
 
 ## Build and test
 
@@ -170,10 +172,8 @@ Test on a physical phone; BLE scanning is generally unavailable or unreliable in
 
 ## Security model
 
-- Both GATT characteristics must be readable/writable without requiring a saved Android bond.
-- The ESP32 initiates encrypted bonding when a phone connects. Pairing remains
-  compatible with phones that support only legacy BLE security; newer phones
-  may negotiate LE Secure Connections.
+- Both GATT characteristics require an encrypted connection.
+- The ESP32 initiates encrypted LE Secure Connections bonding when a phone connects.
 - The ESP32 never prints the password to serial output.
 - The app never stores the WiFi password.
 - Credentials are stored in ESP32 NVS and retained across power loss.
@@ -187,10 +187,10 @@ Because the ESP32 DevKit has no trusted display or keypad, pairing uses Bluetoot
 - **WiFi network is not listed:** ESP32 supports 2.4 GHz WiFi only. Hidden networks can still be entered manually.
 - **Authentication fails:** Re-enter the password; open networks require an empty password.
 - **Connection times out:** Move the robot closer to the access point and verify the SSID is visible.
-- **App builds but BLE is unavailable:** Confirm the native permissions above are present and rebuild the native application after installing `react-native-ble-plx`.
+- **Controls time out after an APK update:** Flash the matching PlatformIO firmware; older firmware does not understand the controller commands.
+- **App builds but BLE is unavailable:** Confirm the native permissions above are present and rebuild the native Android application.
 
 ## References
 
 - [Espressif Arduino BLE API](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/ble.html)
 - [Espressif Preferences/NVS API](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/preferences.html)
-- [react-native-ble-plx setup and API](https://github.com/dotintent/react-native-ble-plx)

@@ -120,10 +120,14 @@ struct SystemState {
   unsigned long lastSensorUpdate =  0;
 } state;
 
-uint16_t basePos     = 330;  // reference home position
-uint16_t shoulderPos = 150;
-uint16_t elbowPos    = 300;
-uint16_t gripperPos  = 410;
+volatile uint16_t basePos = 330; // last commanded base position
+volatile uint16_t shoulderPos = 150;
+volatile uint16_t elbowPos    = 300;
+volatile uint16_t gripperPos  = 410;
+volatile uint16_t servoTargetPos[4] = {330, 150, 300, 410};
+volatile unsigned long servoNextStepAt[4] = {0, 0, 0, 0};
+volatile unsigned long servoManualStopAt[4] = {0, 0, 0, 0};
+volatile bool armSequenceRunning = false;
 
 enum AutoSequenceStep {
   AUTO_IDLE, AUTO_OPENING, AUTO_WAITING,
@@ -178,9 +182,13 @@ void     openDrain();
 void     closeDrain();
 void     stopMotors();
 uint16_t getServoPosition(uint8_t ch);
+uint16_t clampServoPosition(uint8_t ch, int pos);
 void     setServo(uint8_t ch, uint16_t pos);
 void     setServoImmediate(uint8_t ch, uint16_t pos);
-void     servoSpin(uint8_t ch, uint16_t direction, uint32_t ms);
+void     startServoMove(uint8_t ch, int direction);
+void     stopServoMove(uint8_t ch);
+void     updateServoMoves();
+void     waitForServoMove(uint8_t ch);
 void     moveArmHome();
 void     openDrainWithArm();
 void     closeDrainWithArm();
@@ -231,6 +239,7 @@ void setup() {
   pwm.begin();
   pwm.setPWMFreq(SERVO_FREQ);
   delay(10);
+  for (uint8_t ch = 0; ch < 4; ++ch) pwm.setPWM(ch, 0, 4096);
 
   gpsSerial.begin(115200, SERIAL_8N1, A9G_RX, A9G_TX);
   smsSerial.begin(115200, SERIAL_8N1, A7670_RX, A7670_TX);
@@ -252,6 +261,7 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  updateServoMoves();
   updateLED();
   wsServer.loop();      // WebSocket — must be first, handles all real-time commands
   server.handleClient(); // HTTP — status, camera, etc.
@@ -335,16 +345,62 @@ void stopMotors() {
 
 // ============================================================================
 // SERVO FUNCTIONS
-// Servos are CONTINUOUS ROTATION type.
-// Control method: set PWM to spin value for N milliseconds, then cut signal.
-// SERVO_STOP = 0 means no PWM pulse = no torque = servo holds position.
-// Spin values: >307 = one direction, <307 = other direction
+// All four joints follow Robot_arm.ino: one PWM count every 10 ms.
+// Each manual command moves at most 20 counts (200 ms); stop can cancel the ramp.
+// Positional PWM stays active afterward so each joint holds its position.
 // ============================================================================
 
-// Spin speed values — close to 307 = slower, far = faster
-#define SERVO_FWD    340   // forward spin
-#define SERVO_REV    270   // reverse spin
-#define SERVO_STOP     0   // no pulse = no torque = holds
+#define SERVO_STEP_INTERVAL_MS 10
+#define SERVO_STEPS_PER_PRESS 20
+
+void startServoMove(uint8_t ch, int direction) {
+  if (ch > SERVO_GRIPPER || armSequenceRunning) return;
+  const int target = (int)getServoPosition(ch) +
+    (direction < 0 ? -SERVO_STEPS_PER_PRESS : SERVO_STEPS_PER_PRESS);
+  servoTargetPos[ch] = clampServoPosition(ch, target);
+  servoNextStepAt[ch] = millis();
+  servoManualStopAt[ch] = millis() + SERVO_STEP_INTERVAL_MS * SERVO_STEPS_PER_PRESS;
+}
+
+void stopServoMove(uint8_t ch) {
+  if (ch > SERVO_GRIPPER || armSequenceRunning) return;
+  servoTargetPos[ch] = getServoPosition(ch);
+  servoManualStopAt[ch] = 0;
+}
+
+void updateServoMoves() {
+  const unsigned long now = millis();
+  for (uint8_t ch = SERVO_BASE; ch <= SERVO_GRIPPER; ch++) {
+    if (servoManualStopAt[ch] && (long)(now - servoManualStopAt[ch]) >= 0)
+      stopServoMove(ch);
+    const uint16_t current = getServoPosition(ch);
+    if (current == servoTargetPos[ch] || (long)(now - servoNextStepAt[ch]) < 0) continue;
+    const uint16_t next = current + (servoTargetPos[ch] > current ? 1 : -1);
+    pwm.setPWM(ch, 0, next);
+    switch (ch) {
+      case SERVO_BASE: basePos = next; break;
+      case SERVO_SHOULDER: shoulderPos = next; break;
+      case SERVO_ELBOW: elbowPos = next; break;
+      case SERVO_GRIPPER: gripperPos = next; break;
+    }
+    servoNextStepAt[ch] = now + SERVO_STEP_INTERVAL_MS;
+  }
+}
+
+void waitForServoMove(uint8_t ch) {
+  while (getServoPosition(ch) != servoTargetPos[ch])
+    vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_INTERVAL_MS));
+}
+
+uint16_t clampServoPosition(uint8_t ch, int pos) {
+  switch (ch) {
+    case SERVO_BASE:     return constrain(pos, SERVO_BASE_MIN, SERVO_BASE_MAX);
+    case SERVO_SHOULDER: return constrain(pos, SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
+    case SERVO_ELBOW:    return constrain(pos, SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
+    case SERVO_GRIPPER:  return constrain(pos, SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
+    default:             return 0;
+  }
+}
 
 uint16_t getServoPosition(uint8_t ch) {
   switch (ch) {
@@ -357,62 +413,102 @@ uint16_t getServoPosition(uint8_t ch) {
 }
 
 void setServo(uint8_t ch, uint16_t val) {
-  pwm.setPWM(ch, 0, val);
+  setServoImmediate(ch, val);
 }
 
 void setServoImmediate(uint8_t ch, uint16_t val) {
-  pwm.setPWM(ch, 0, val);
+  if (ch > SERVO_GRIPPER) return;
+  val = clampServoPosition(ch, val);
+  servoManualStopAt[ch] = 0;
+  servoTargetPos[ch] = val;
+  servoNextStepAt[ch] = millis();
+  if (val == getServoPosition(ch)) pwm.setPWM(ch, 0, val);
 }
 
-// Spin a servo for `ms` milliseconds in given direction, then stop.
-// Call ONLY from inside a FreeRTOS task.
-void servoSpin(uint8_t ch, uint16_t direction, uint32_t ms) {
-  pwm.setPWM(ch, 0, direction);
-  vTaskDelay(pdMS_TO_TICKS(ms));
-  pwm.setPWM(ch, 0, SERVO_STOP);
-  vTaskDelay(pdMS_TO_TICKS(50)); // brief settle
-}
-
-// Arm sequence — all timing tuned for continuous rotation servos
 static void armHomeTask(void *) {
   Serial.println("[Arm] Home");
-  servoSpin(SERVO_GRIPPER,  SERVO_REV, 400);  // open gripper
-  servoSpin(SERVO_ELBOW,    SERVO_REV, 300);  // retract elbow
-  servoSpin(SERVO_SHOULDER, SERVO_REV, 400);  // raise shoulder
-  servoSpin(SERVO_BASE,     SERVO_FWD, 300);  // center base
+  setServoImmediate(SERVO_GRIPPER, 410);
+  waitForServoMove(SERVO_GRIPPER);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_ELBOW, 300);
+  waitForServoMove(SERVO_ELBOW);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_SHOULDER, 150);
+  waitForServoMove(SERVO_SHOULDER);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_BASE, 330);
+  waitForServoMove(SERVO_BASE);
+  armSequenceRunning = false;
   vTaskDelete(nullptr);
 }
 
 static void armOpenTask(void *) {
   Serial.println("[Arm] Open drain");
-  servoSpin(SERVO_BASE,     SERVO_REV, 400);  // rotate base
-  servoSpin(SERVO_SHOULDER, SERVO_FWD, 400);  // lower shoulder
-  servoSpin(SERVO_ELBOW,    SERVO_FWD, 300);  // extend elbow
-  servoSpin(SERVO_GRIPPER,  SERVO_FWD, 400);  // close gripper
+  setServoImmediate(SERVO_BASE, 250);
+  waitForServoMove(SERVO_BASE);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_SHOULDER, 380);
+  waitForServoMove(SERVO_SHOULDER);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_ELBOW, 380);
+  waitForServoMove(SERVO_ELBOW);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_GRIPPER, 510);
+  waitForServoMove(SERVO_GRIPPER);
   state.drainOpen = true;
+  armSequenceRunning = false;
   vTaskDelete(nullptr);
 }
 
 static void armCloseTask(void *) {
   Serial.println("[Arm] Close drain");
-  servoSpin(SERVO_GRIPPER,  SERVO_REV, 400);  // open gripper
-  servoSpin(SERVO_ELBOW,    SERVO_REV, 300);  // retract elbow
-  servoSpin(SERVO_SHOULDER, SERVO_REV, 400);  // raise shoulder
-  servoSpin(SERVO_BASE,     SERVO_FWD, 400);  // center base
+  setServoImmediate(SERVO_GRIPPER, 410);
+  waitForServoMove(SERVO_GRIPPER);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_ELBOW, 300);
+  waitForServoMove(SERVO_ELBOW);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_SHOULDER, 150);
+  waitForServoMove(SERVO_SHOULDER);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  setServoImmediate(SERVO_BASE, 330);
+  waitForServoMove(SERVO_BASE);
   state.drainOpen = false;
+  armSequenceRunning = false;
   vTaskDelete(nullptr);
 }
 
 void moveArmHome() {
-  xTaskCreate(armHomeTask, "armHome", 3072, nullptr, 1, nullptr);
+  if (armSequenceRunning) return;
+  armSequenceRunning = true;
+  for (uint8_t ch = SERVO_BASE; ch <= SERVO_GRIPPER; ch++) {
+    servoManualStopAt[ch] = 0;
+    servoTargetPos[ch] = getServoPosition(ch);
+  }
+  if (xTaskCreate(armHomeTask, "armHome", 3072, nullptr, 1, nullptr) != pdPASS)
+    armSequenceRunning = false;
 }
 
 void openDrainWithArm() {
-  xTaskCreate(armOpenTask, "armOpen", 3072, nullptr, 1, nullptr);
+  if (armSequenceRunning) return;
+  armSequenceRunning = true;
+  for (uint8_t ch = SERVO_BASE; ch <= SERVO_GRIPPER; ch++) {
+    servoManualStopAt[ch] = 0;
+    servoTargetPos[ch] = getServoPosition(ch);
+  }
+  if (xTaskCreate(armOpenTask, "armOpen", 3072, nullptr, 1, nullptr) != pdPASS)
+    armSequenceRunning = false;
 }
 
 void closeDrainWithArm() {
-  xTaskCreate(armCloseTask, "armClose", 3072, nullptr, 1, nullptr);
+  if (armSequenceRunning) return;
+  armSequenceRunning = true;
+  for (uint8_t ch = SERVO_BASE; ch <= SERVO_GRIPPER; ch++) {
+    servoManualStopAt[ch] = 0;
+    servoTargetPos[ch] = getServoPosition(ch);
+  }
+  if (xTaskCreate(armCloseTask, "armClose", 3072, nullptr, 1, nullptr) != pdPASS)
+    armSequenceRunning = false;
 }
 
 // ============================================================================
@@ -424,7 +520,7 @@ void updateAutoMode() {
   unsigned long now = millis();
   switch (autoStep) {
     case AUTO_IDLE:
-      if (state.distance > 0 &&
+      if (!armSequenceRunning && state.distance > 0 &&
           state.distance <= autoDetectionRange &&
           now - autoLastOperation >= AUTO_OPERATION_COOLDOWN_MS) {
         autoModeOperating = true;
@@ -435,16 +531,16 @@ void updateAutoMode() {
       }
       break;
     case AUTO_OPENING:
-      if (now - autoStepTime >= 3000) { autoStep = AUTO_WAITING; autoStepTime = now; }
+      if (!armSequenceRunning) { autoStep = AUTO_WAITING; autoStepTime = now; }
       break;
     case AUTO_WAITING:
       if (now - autoStepTime >= 2000) { closeDrainWithArm(); autoStep = AUTO_CLOSING; autoStepTime = millis(); }
       break;
     case AUTO_CLOSING:
-      if (now - autoStepTime >= 3000) { moveArmHome(); autoStep = AUTO_HOMING; autoStepTime = millis(); }
+      if (!armSequenceRunning) { moveArmHome(); autoStep = AUTO_HOMING; autoStepTime = millis(); }
       break;
     case AUTO_HOMING:
-      if (now - autoStepTime >= 2000) { autoModeOperating = false; autoStep = AUTO_COOLDOWN; autoStepTime = now; }
+      if (!armSequenceRunning) { autoModeOperating = false; autoStep = AUTO_COOLDOWN; autoStepTime = now; }
       break;
     case AUTO_COOLDOWN:
       if (now - autoStepTime >= 5000) { autoStep = AUTO_IDLE; }
@@ -603,8 +699,9 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t lengt
 
     case WStype_DISCONNECTED:
       Serial.printf("[WS] Client %u disconnected\n", num);
-      // Safety: stop motors when client disconnects
+      // Stop drive motors and any manual joint movement when a controller disconnects.
       stopMotors();
+      for (uint8_t ch = SERVO_BASE; ch <= SERVO_GRIPPER; ch++) stopServoMove(ch);
       break;
 
     case WStype_TEXT: {
@@ -644,22 +741,10 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t lengt
         else if (strcmp(joint, "gripper")  == 0) ch = SERVO_GRIPPER;
         if (ch == 255) return;
 
-        uint16_t spinVal = (strcmp(dir, "fwd") == 0) ? SERVO_FWD : SERVO_REV;
-        pwm.setPWM(ch, 0, spinVal);
-
-        // Auto-stop after 220ms
-        struct ServoStop { uint8_t ch; };
-        ServoStop *s = (ServoStop *)malloc(sizeof(ServoStop));
-        if (s) {
-          s->ch = ch;
-          xTaskCreate([](void *arg) {
-            ServoStop *s = (ServoStop *)arg;
-            vTaskDelay(pdMS_TO_TICKS(220));
-            pwm.setPWM(s->ch, 0, SERVO_STOP); // no pulse = no torque = holds
-            free(s);
-            vTaskDelete(nullptr);
-          }, "sStop", 1024, s, 1, nullptr);
-        }
+        if (strcmp(dir, "stop") == 0) stopServoMove(ch);
+        else if (strcmp(dir, "fwd") == 0) startServoMove(ch, 1);
+        else if (strcmp(dir, "rev") == 0) startServoMove(ch, -1);
+        else return;
         wsServer.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"servo\"}");
 
       } else if (strcmp(cmd, "arm") == 0) {
@@ -835,6 +920,55 @@ void setupAPIEndpoints() {
     server.send(200, "application/json", "{\"status\":\"home\"}");
   });
 
+  // All manual joints use the same 20-count (200 ms) ramp per press.
+  server.on("/api/servo/step", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    const String joint = server.arg("joint");
+    const String direction = server.arg("direction");
+    uint8_t ch = 255;
+    if (joint == "base") ch = SERVO_BASE;
+    else if (joint == "shoulder") ch = SERVO_SHOULDER;
+    else if (joint == "elbow") ch = SERVO_ELBOW;
+    else if (joint == "gripper") ch = SERVO_GRIPPER;
+    if (ch == 255 || (direction != "-1" && direction != "1")) {
+      server.send(400, "application/json", "{\"error\":\"invalid joint or direction\"}"); return;
+    }
+    startServoMove(ch, direction == "-1" ? -1 : 1);
+    server.send(200, "application/json", "{\"status\":\"moving\"}");
+  });
+  server.on("/api/servo/stop", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    const String joint = server.arg("joint");
+    uint8_t ch = 255;
+    if (joint == "base") ch = SERVO_BASE;
+    else if (joint == "shoulder") ch = SERVO_SHOULDER;
+    else if (joint == "elbow") ch = SERVO_ELBOW;
+    else if (joint == "gripper") ch = SERVO_GRIPPER;
+    if (ch == 255) {
+      server.send(400, "application/json", "{\"error\":\"invalid joint\"}"); return;
+    }
+    stopServoMove(ch);
+    server.send(200, "application/json", "{\"status\":\"stopped\"}");
+  });
+
+  // Keep the original base routes for older app builds.
+  server.on("/api/servo/base/left", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startServoMove(SERVO_BASE, 1);
+    server.send(200, "application/json", "{\"status\":\"moving\"}");
+  });
+  server.on("/api/servo/base/right", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    startServoMove(SERVO_BASE, -1);
+    server.send(200, "application/json", "{\"status\":\"moving\"}");
+  });
+  server.on("/api/servo/base/stop", HTTP_POST, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    stopServoMove(SERVO_BASE);
+    server.send(200, "application/json", "{\"status\":\"stopped\"}");
+  });
+
+  // Legacy position endpoint: ramp to the requested positional PWM value.
   // POST /api/servo/base?position=330
   server.on("/api/servo/base", HTTP_POST, []() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -887,6 +1021,7 @@ void setupAPIEndpoints() {
     doc["shoulder"] = shoulderPos;
     doc["elbow"]    = elbowPos;
     doc["gripper"]  = gripperPos;
+    doc["arm_busy"] = armSequenceRunning;
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });

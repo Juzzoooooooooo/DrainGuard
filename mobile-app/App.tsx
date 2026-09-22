@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   BackHandler,
   NativeModules,
@@ -52,6 +52,14 @@ function App() {
   const [ready, setReady] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const servoCommandQueues = useRef<Record<keyof ServoPositions, Promise<void>>>(
+    {
+      base: Promise.resolve(),
+      shoulder: Promise.resolve(),
+      elbow: Promise.resolve(),
+      gripper: Promise.resolve(),
+    },
+  );
 
   const cameraApi = useMemo(
     () => new DrainGuardApi(settings.deviceIp),
@@ -123,40 +131,16 @@ function App() {
     return () => clearInterval(interval);
   }, [ready, refreshStatus, settings.refreshRate]);
 
-  // Arm control via HTTP
-  const controlArm = useCallback(
-    async (action: 'open' | 'close') => {
-      try {
-        if (action === 'open') {
-          await httpAPI.armOpen();
-        } else {
-          await httpAPI.armClose();
-        }
+  // Keep each joint's start and stop requests in order on a quick tap.
+  const controlJoint = useCallback(
+    (joint: keyof ServoPositions, direction: -1 | 0 | 1): Promise<void> => {
+      const request = servoCommandQueues.current[joint].then(async () => {
+        if (direction === 0) await httpAPI.stopServo(joint);
+        else await httpAPI.stepServo(joint, direction);
         setConnected(true);
-        notify(`Arm ${action} command sent.`, 'success');
-      } catch (error) {
-        notify(`Failed to run the arm ${action} action.`, 'danger');
-        throw error;
-      }
-    },
-    [notify],
-  );
-
-  // Servo control via HTTP
-  const controlServo = useCallback(
-    async (servo: keyof ServoPositions, position: number) => {
-      try {
-        const pos = Math.round(position);
-        switch (servo) {
-          case 'base':     await httpAPI.moveBase(pos);     break;
-          case 'shoulder': await httpAPI.moveShoulder(pos); break;
-          case 'elbow':    await httpAPI.moveElbow(pos);    break;
-          case 'gripper':  await httpAPI.moveGripper(pos);  break;
-        }
-        setConnected(true);
-      } catch (error) {
-        throw error;
-      }
+      });
+      servoCommandQueues.current[joint] = request.catch(() => undefined);
+      return request;
     },
     [],
   );
@@ -215,9 +199,8 @@ function App() {
         <CameraScreen
           loadStreamUrl={loadStreamUrl}
           notify={notify}
-          onArm={controlArm}
+          onJoint={controlJoint}
           onExit={() => setActiveTab('dashboard')}
-          onServo={controlServo}
         />
         {toastView}
       </View>

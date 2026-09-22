@@ -20,7 +20,7 @@ Materials
 - ESP32 DevKit V1
 - PCA9685 PWM Servo Driver
 - TB6612FNG Motor Driver
-- 4x Continuous Rotation Servos (robot arm)
+- 4 positional arm servos; the base moves in small 10 ms steps
 - 2x DC Motors and wheels
 - Ultrasonic Sensor HC-SR04
 - 1000uF 16V Capacitor x2 (motor and servo power)
@@ -181,8 +181,7 @@ Step 11 - Test
 4. Test each function:
    - Forward and Backward by holding the button
    - Left and Right turns by tapping
-   - Claw left and right by tapping
-   - Shoulder up and down by tapping
+   - Press each BASE, SHOULDER, ELBOW, and GRIPPER direction button separately. Every joint moves one PWM count every 10 ms for at most 200 ms per press; releasing the button stops the position change.
    - Open and Close arm sequence
    - Dashboard water level reading
 
@@ -202,4 +201,4 @@ Problem: App cannot connect
 Solution: Make sure phone is on DrainGuard-Robot WiFi
 
 Problem: Arm rotates on boot
-Solution: Normal - servos go to home position on startup
+Solution: Check the loaded firmware and PCA9685 wiring. Current firmware leaves the servo outputs off at startup and moves the arm only after a control command.

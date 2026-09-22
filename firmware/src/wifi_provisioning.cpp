@@ -92,6 +92,7 @@ private:
 
 WiFiProvisioningManager::WiFiProvisioningManager()
   : commandQueue(nullptr),
+    controllerCommandQueue(nullptr),
     bleServer(nullptr),
     statusCharacteristic(nullptr),
     connectionState(WIFI_IDLE),
@@ -111,6 +112,7 @@ void WiFiProvisioningManager::begin(
 ) {
   configuredApiEndpoint = defaultApiEndpoint;
   commandQueue = xQueueCreate(3, sizeof(ProvisioningCommand));
+  controllerCommandQueue = xQueueCreate(8, sizeof(ControllerCommand));
 
   uint64_t chipId = ESP.getEfuseMac();
   char suffix[5];
@@ -176,27 +178,36 @@ void WiFiProvisioningManager::initializeBle() {
     Serial.printf("Unable to set BLE MTU (error %d); using default\n", mtuResult);
   }
 
-  // SIMPLIFIED: No encryption/bonding for easier phone connection
-  // This allows any phone to connect without pairing issues
+  // Controller commands and WiFi credentials share this service, so require
+  // an encrypted, bonded link. With no display or keypad the ESP32 uses the
+  // Bluetooth "Just Works" association model.
+  BLEDevice::setSecurityCallbacks(new ProvisioningSecurityCallbacks());
+  BLESecurity *security = new BLESecurity();
+  security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+  security->setCapability(ESP_IO_CAP_NONE);
+  security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  setBleEncryptionLevel<BLEDevice, BLESecurity>(ESP_BLE_SEC_ENCRYPT, 0);
+
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ProvisioningServerCallbacks(this));
 
   BLEService *service = bleServer->createService(DRAINGUARD_PROVISIONING_SERVICE_UUID);
 
-  // Status characteristic (read/notify) - NO ENCRYPTION
+  // Status characteristic (read/notify) over the encrypted link.
   statusCharacteristic = service->createCharacteristic(
     DRAINGUARD_PROVISIONING_TX_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
   );
-  statusCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ);
+  statusCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
   statusCharacteristic->addDescriptor(new BLE2902());
 
-  // Command characteristic (write) - NO ENCRYPTION
+  // Provisioning and controller commands require an encrypted write.
   BLECharacteristic *commandCharacteristic = service->createCharacteristic(
     DRAINGUARD_PROVISIONING_RX_UUID,
     BLECharacteristic::PROPERTY_WRITE
   );
-  commandCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE);
+  commandCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
   commandCharacteristic->setCallbacks(new ProvisioningWriteCallbacks(this));
 
   service->start();
@@ -211,7 +222,7 @@ void WiFiProvisioningManager::initializeBle() {
   BLEDevice::startAdvertising();
 
   notifyReady();
-  Serial.printf("BLE provisioning active as %s (no encryption for easy pairing)\n", deviceName.c_str());
+  Serial.printf("Secure BLE controller active as %s\n", deviceName.c_str());
 }
 
 void WiFiProvisioningManager::loadStoredConfiguration() {
@@ -342,6 +353,68 @@ void WiFiProvisioningManager::enqueuePayload(const String &payload) {
   const char *commandName = document["command"] | "";
   ProvisioningCommand command = {};
 
+  if (
+    strcmp(commandName, "get_status") == 0 ||
+    strcmp(commandName, "arm") == 0 ||
+    strcmp(commandName, "servo") == 0
+  ) {
+    ControllerCommand controllerCommand = {};
+    controllerCommand.requestId = document["id"] | 0;
+    if (controllerCommand.requestId == 0) {
+      notifyStatus("invalid", "Controller command is missing its request id");
+      return;
+    }
+
+    if (strcmp(commandName, "get_status") == 0) {
+      controllerCommand.type = CONTROLLER_GET_STATUS;
+    } else if (strcmp(commandName, "arm") == 0) {
+      const char *action = document["action"] | "";
+      if (strcmp(action, "open") == 0) {
+        controllerCommand.type = CONTROLLER_ARM_OPEN;
+      } else if (strcmp(action, "close") == 0) {
+        controllerCommand.type = CONTROLLER_ARM_CLOSE;
+      } else {
+        notifyControllerResult(controllerCommand.requestId, false, "Unsupported arm action");
+        return;
+      }
+    } else {
+      const char *servoName = document["servo"] | "";
+      if (!document["position"].is<int>()) {
+        notifyControllerResult(controllerCommand.requestId, false, "Servo position is required");
+        return;
+      }
+
+      int position = document["position"].as<int>();
+      if (position < 0 || position > 4095) {
+        notifyControllerResult(controllerCommand.requestId, false, "Servo position is invalid");
+        return;
+      }
+
+      controllerCommand.type = CONTROLLER_SERVO;
+      controllerCommand.position = static_cast<uint16_t>(position);
+      if (strcmp(servoName, "base") == 0) {
+        controllerCommand.servo = CONTROLLER_SERVO_BASE;
+      } else if (strcmp(servoName, "shoulder") == 0) {
+        controllerCommand.servo = CONTROLLER_SERVO_SHOULDER;
+      } else if (strcmp(servoName, "elbow") == 0) {
+        controllerCommand.servo = CONTROLLER_SERVO_ELBOW;
+      } else if (strcmp(servoName, "gripper") == 0) {
+        controllerCommand.servo = CONTROLLER_SERVO_GRIPPER;
+      } else {
+        notifyControllerResult(controllerCommand.requestId, false, "Unsupported servo");
+        return;
+      }
+    }
+
+    if (
+      controllerCommandQueue == nullptr ||
+      xQueueSend(controllerCommandQueue, &controllerCommand, 0) != pdTRUE
+    ) {
+      notifyControllerResult(controllerCommand.requestId, false, "Controller command queue is busy");
+    }
+    return;
+  }
+
   if (strcmp(commandName, "scan_wifi") == 0) {
     command.type = COMMAND_SCAN_WIFI;
   } else if (strcmp(commandName, "forget_wifi") == 0) {
@@ -433,8 +506,7 @@ void WiFiProvisioningManager::startWifiConnection(
   document["ssid"] = activeSsid;
   String payload;
   serializeJson(document, payload);
-  statusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) statusCharacteristic->notify();
+  notifyPayload(payload);
 
   Serial.printf("Connecting to provisioned WiFi SSID: %s\n", activeSsid.c_str());
 }
@@ -462,8 +534,7 @@ void WiFiProvisioningManager::updateWifiConnection() {
     document["saved"] = saved;
     String payload;
     serializeJson(document, payload);
-    statusCharacteristic->setValue(payload.c_str());
-    if (bleClientConnected) statusCharacteristic->notify();
+    notifyPayload(payload);
 
     Serial.printf("WiFi connected. IP address: %s\n", WiFi.localIP().toString().c_str());
     if (!BLE_PROVISIONING_STAY_ACTIVE) {
@@ -485,8 +556,7 @@ void WiFiProvisioningManager::updateWifiConnection() {
     document["message"] = "Unable to join WiFi within 30 seconds";
     String payload;
     serializeJson(document, payload);
-    statusCharacteristic->setValue(payload.c_str());
-    if (bleClientConnected) statusCharacteristic->notify();
+    notifyPayload(payload);
 
     Serial.printf("WiFi connection failed: %s\n", wifiFailureReason(finalStatus));
   }
@@ -524,8 +594,7 @@ void WiFiProvisioningManager::forgetWifi() {
   document["hotspot_ip"] = WiFi.softAPIP().toString();
   String payload;
   serializeJson(document, payload);
-  statusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) statusCharacteristic->notify();
+  notifyPayload(payload);
 
   Serial.println("Saved WiFi credentials cleared; private hotspot remains active");
 }
@@ -577,11 +646,7 @@ void WiFiProvisioningManager::updateWifiScan() {
     document["secure"] = WiFi.encryptionType(index) != WIFI_AUTH_OPEN;
     String payload;
     serializeJson(document, payload);
-    statusCharacteristic->setValue(payload.c_str());
-    if (bleClientConnected) {
-      statusCharacteristic->notify();
-      delay(20);
-    }
+    notifyPayload(payload);
   }
 
   WiFi.scanDelete();
@@ -592,8 +657,79 @@ void WiFiProvisioningManager::updateWifiScan() {
   document["count"] = networkCount;
   String payload;
   serializeJson(document, payload);
-  statusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) statusCharacteristic->notify();
+  notifyPayload(payload);
+}
+
+bool WiFiProvisioningManager::nextControllerCommand(ControllerCommand &command) {
+  return
+    controllerCommandQueue != nullptr &&
+    xQueueReceive(controllerCommandQueue, &command, 0) == pdTRUE;
+}
+
+void WiFiProvisioningManager::notifyControllerStatus(
+  uint32_t requestId,
+  float waterLevel,
+  float distance,
+  bool drainOpen,
+  float latitude,
+  float longitude,
+  int satellites
+) {
+  StaticJsonDocument<256> document;
+  document["status"] = "controller_status";
+  document["id"] = requestId;
+  document["wl"] = waterLevel;
+  document["d"] = distance;
+  document["o"] = drainOpen;
+  document["lat"] = latitude;
+  document["lon"] = longitude;
+  document["sat"] = satellites;
+
+  String payload;
+  serializeJson(document, payload);
+  notifyPayload(payload);
+}
+
+void WiFiProvisioningManager::notifyControllerResult(
+  uint32_t requestId,
+  bool ok,
+  const String &message
+) {
+  StaticJsonDocument<160> document;
+  document["status"] = "command_result";
+  document["id"] = requestId;
+  document["ok"] = ok;
+  if (message.length() > 0) document["message"] = message;
+
+  String payload;
+  serializeJson(document, payload);
+  notifyPayload(payload);
+}
+
+void WiFiProvisioningManager::notifyPayload(const String &payload) {
+  if (statusCharacteristic == nullptr) return;
+
+  if (!bleClientConnected) {
+    statusCharacteristic->setValue(payload.c_str());
+    return;
+  }
+
+  String framedPayload = payload + "\n";
+  // The server API exposes the configured local MTU, not reliably the peer's
+  // negotiated MTU on every Arduino-ESP32 release. Twenty-byte notifications
+  // therefore keep responses compatible even when an Android stack leaves the
+  // connection at the default 23-byte ATT MTU.
+  constexpr size_t chunkSize = 20;
+
+  for (size_t offset = 0; offset < framedPayload.length(); offset += chunkSize) {
+    String chunk = framedPayload.substring(
+      offset,
+      min(offset + chunkSize, framedPayload.length())
+    );
+    statusCharacteristic->setValue(chunk.c_str());
+    statusCharacteristic->notify();
+    delay(15);
+  }
 }
 
 void WiFiProvisioningManager::notifyReady() {
@@ -611,8 +747,7 @@ void WiFiProvisioningManager::notifyReady() {
 
   String payload;
   serializeJson(document, payload);
-  statusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) statusCharacteristic->notify();
+  notifyPayload(payload);
 }
 
 void WiFiProvisioningManager::notifyStatus(const String &status, const String &message) {
@@ -623,8 +758,7 @@ void WiFiProvisioningManager::notifyStatus(const String &status, const String &m
   if (message.length() > 0) document["message"] = message;
   String payload;
   serializeJson(document, payload);
-  statusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) statusCharacteristic->notify();
+  notifyPayload(payload);
 }
 
 const char *WiFiProvisioningManager::wifiFailureReason(wl_status_t status) const {

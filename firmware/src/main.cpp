@@ -43,6 +43,7 @@ void updateSystemState();
 void checkAlerts();
 void sendTelemetry();
 void checkAutoMode();
+void processBleControllerCommand();
 
 void setup() {
   Serial.begin(115200);
@@ -77,6 +78,7 @@ void setup() {
 
 void loop() {
   provisioning.update();
+  processBleControllerCommand();
 
   if (httpServerStarted) {
     server.handleClient();
@@ -101,6 +103,56 @@ void loop() {
   smsModule.checkMessages();
   
   delay(10);
+}
+
+void processBleControllerCommand() {
+  WiFiProvisioningManager::ControllerCommand command;
+  if (!provisioning.nextControllerCommand(command)) return;
+
+  switch (command.type) {
+    case WiFiProvisioningManager::CONTROLLER_GET_STATUS:
+      provisioning.notifyControllerStatus(
+        command.requestId,
+        state.waterLevel,
+        state.distance,
+        state.drainOpen,
+        state.gpsData.latitude,
+        state.gpsData.longitude,
+        state.gpsData.satellites
+      );
+      break;
+
+    case WiFiProvisioningManager::CONTROLLER_ARM_OPEN:
+      // Acknowledge before the smooth arm sequence blocks the Arduino loop.
+      provisioning.notifyControllerResult(command.requestId, true, "accepted");
+      servoArm.openDrainWithArm();
+      state.drainOpen = true;
+      break;
+
+    case WiFiProvisioningManager::CONTROLLER_ARM_CLOSE:
+      provisioning.notifyControllerResult(command.requestId, true, "accepted");
+      servoArm.closeDrainWithArm();
+      state.drainOpen = false;
+      break;
+
+    case WiFiProvisioningManager::CONTROLLER_SERVO:
+      switch (command.servo) {
+        case WiFiProvisioningManager::CONTROLLER_SERVO_BASE:
+          servoArm.setBaseImmediate(command.position);
+          break;
+        case WiFiProvisioningManager::CONTROLLER_SERVO_SHOULDER:
+          servoArm.setShoulderImmediate(command.position);
+          break;
+        case WiFiProvisioningManager::CONTROLLER_SERVO_ELBOW:
+          servoArm.setElbowImmediate(command.position);
+          break;
+        case WiFiProvisioningManager::CONTROLLER_SERVO_GRIPPER:
+          servoArm.setGripperImmediate(command.position);
+          break;
+      }
+      provisioning.notifyControllerResult(command.requestId, true, "moved");
+      break;
+  }
 }
 
 // Auto mode uses a state machine to avoid blocking the main loop

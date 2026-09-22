@@ -14,6 +14,8 @@ mobile-app/android/build/
 mobile-app/android/app/build/
 mobile-app/android/.gradle/
 mobile-app/.gradle/
+mobile-app/android/app/src/main/assets/index.android.bundle
+mobile-app/android/app/debug.keystore
 
 # Node modules
 mobile-app/node_modules/

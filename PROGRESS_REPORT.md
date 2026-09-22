@@ -53,12 +53,57 @@ Key Challenges & Solutions
 4. Pin Mapping: Navigated ESP32 boot strapping constraints (GPIO 0,12,15) to avoid conflicts.
 5. Multi-file Compilation: Confirmed PlatformIO handles multiple .cpp files (main.cpp + wifi_provisioning.cpp) correctly.
 
-Current Status
+## Current Status
 
 - Hardware: 95% complete - all components installed and wired
-- Firmware: 95% complete - core functionality working, final testing
-- Mobile App: 95% complete - APK built and functional
-- Documentation: Comprehensive guides created for setup, wiring, and operation
+- Firmware: 98% complete - dual connectivity (Bluetooth + WiFi) for camera control implemented
+- Mobile App: 95% complete - APK built and functional, camera controls ready for integration
+- Documentation: Comprehensive guides created for setup, wiring, operation, and camera control
+
+## New Features Added (September 2026)
+
+### Dual Connectivity Camera Control System
+
+Enhanced the DrainGuard robot with comprehensive **Bluetooth + WiFi camera control**:
+
+**Bluetooth Low Energy (BLE) Camera Commands:**
+- Real-time camera control via BLE GATT service
+- Commands: capture photo, start/stop streaming, adjust quality/brightness/contrast
+- Flash LED control (on/off)
+- Camera status reporting via BLE notifications
+- Low-power operation for remote control scenarios
+- Range: 10-30 meters typical
+
+**WiFi HTTP API Camera Endpoints:**
+- RESTful API for camera configuration
+- High-bandwidth video streaming support
+- Real-time parameter adjustment (quality: 320x240 to 1024x768)
+- Image capture and status monitoring
+- CORS-enabled for web app compatibility
+
+**Integrated Features:**
+- Dual-mode operation: BLE for control, WiFi for streaming
+- Automatic camera availability detection (every 10 seconds)
+- Camera state synchronization across both protocols
+- Extended system status with camera telemetry
+- Support for quality levels: Low, Medium, High, Max
+- Brightness and contrast adjustment (-2 to +2 range)
+
+**Implementation Details:**
+- Enhanced `camera.h` module with dual connectivity support
+- BLE command parser with 9 new camera-specific commands
+- HTTP API with 8 camera control endpoints
+- Background camera health monitoring
+- Non-blocking camera probes in main loop
+- JSON-based command/response protocol
+
+**Documentation:**
+- Complete camera control guide (`CAMERA_CONTROL_GUIDE.md`)
+- BLE command reference with examples
+- WiFi REST API documentation
+- Mobile app integration examples (React Native, Python, Arduino)
+- ESP32-CAM firmware template included
+- Troubleshooting and performance recommendations
 
 Testing Results
 

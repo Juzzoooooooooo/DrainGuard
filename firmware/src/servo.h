@@ -251,20 +251,40 @@ public:
     position = constrain(position, SERVO_BASE_MIN, SERVO_BASE_MAX);
     setServoSmooth(SERVO_BASE, position);
   }
+
+  void setBaseImmediate(uint16_t position) {
+    position = constrain(position, SERVO_BASE_MIN, SERVO_BASE_MAX);
+    setServo(SERVO_BASE, position);
+  }
   
   void setShoulder(uint16_t position) {
     position = constrain(position, SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
     setServoSmooth(SERVO_SHOULDER, position);
+  }
+
+  void setShoulderImmediate(uint16_t position) {
+    position = constrain(position, SERVO_SHOULDER_MIN, SERVO_SHOULDER_MAX);
+    setServo(SERVO_SHOULDER, position);
   }
   
   void setElbow(uint16_t position) {
     position = constrain(position, SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
     setServoSmooth(SERVO_ELBOW, position);
   }
+
+  void setElbowImmediate(uint16_t position) {
+    position = constrain(position, SERVO_ELBOW_MIN, SERVO_ELBOW_MAX);
+    setServo(SERVO_ELBOW, position);
+  }
   
   void setGripper(uint16_t position) {
     position = constrain(position, SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
     setServoSmooth(SERVO_GRIPPER, position);
+  }
+
+  void setGripperImmediate(uint16_t position) {
+    position = constrain(position, SERVO_GRIPPER_MIN, SERVO_GRIPPER_MAX);
+    setServo(SERVO_GRIPPER, position);
   }
   
   // Get current positions

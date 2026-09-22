@@ -88,6 +88,12 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0.0"
+        ndk {
+            // arm64-v8a  = all modern Android phones (2016+)
+            // armeabi-v7a = older 32-bit phones (pre-2016)
+            // Remove x86/x86_64 since those are emulators only
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
     }
     signingConfigs {
         debug {

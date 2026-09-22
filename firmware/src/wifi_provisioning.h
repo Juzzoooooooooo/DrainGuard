@@ -18,6 +18,27 @@
 
 class WiFiProvisioningManager {
 public:
+  enum ControllerCommandType : uint8_t {
+    CONTROLLER_GET_STATUS,
+    CONTROLLER_ARM_OPEN,
+    CONTROLLER_ARM_CLOSE,
+    CONTROLLER_SERVO,
+  };
+
+  enum ControllerServo : uint8_t {
+    CONTROLLER_SERVO_BASE,
+    CONTROLLER_SERVO_SHOULDER,
+    CONTROLLER_SERVO_ELBOW,
+    CONTROLLER_SERVO_GRIPPER,
+  };
+
+  struct ControllerCommand {
+    ControllerCommandType type;
+    ControllerServo servo;
+    uint32_t requestId;
+    uint16_t position;
+  };
+
   WiFiProvisioningManager();
 
   void begin(const char *defaultSsid, const char *defaultPassword, const char *defaultApiEndpoint);
@@ -28,6 +49,17 @@ public:
   String getApiEndpoint() const;
   String getDeviceName() const;
   String getHotspotIP() const;
+  bool nextControllerCommand(ControllerCommand &command);
+  void notifyControllerStatus(
+    uint32_t requestId,
+    float waterLevel,
+    float distance,
+    bool drainOpen,
+    float latitude,
+    float longitude,
+    int satellites
+  );
+  void notifyControllerResult(uint32_t requestId, bool ok, const String &message = "");
 
   // Called by BLE callbacks. They are public so the small adapter callback
   // classes do not need access to the rest of the manager's internal state.
@@ -74,12 +106,14 @@ private:
   void updateWifiScan();
   void forgetWifi();
   void restartAdvertisingIfNeeded();
+  void notifyPayload(const String &payload);
   void notifyReady();
   void notifyStatus(const String &status, const String &message = "");
   const char *wifiFailureReason(wl_status_t status) const;
 
   Preferences preferences;
   QueueHandle_t commandQueue;
+  QueueHandle_t controllerCommandQueue;
   BLEServer *bleServer;
   BLECharacteristic *statusCharacteristic;
 

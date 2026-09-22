@@ -30,6 +30,7 @@ export interface ServoStatus {
   shoulder: number;
   elbow: number;
   gripper: number;
+  arm_busy: boolean;
 }
 
 export interface AutoModeStatus {
@@ -217,11 +218,31 @@ class HTTPAPIService {
     return this.get<ServoStatus>('/servo/status');
   }
 
+  async stepServo(joint: 'base' | 'shoulder' | 'elbow' | 'gripper', direction: -1 | 1): Promise<{status: string}> {
+    return this.post(`/servo/step?joint=${joint}&direction=${direction}`);
+  }
+
+  async stopServo(joint: 'base' | 'shoulder' | 'elbow' | 'gripper'): Promise<{status: string}> {
+    return this.post(`/servo/stop?joint=${joint}`);
+  }
+
   /**
    * Move base servo
    */
   async moveBase(position: number): Promise<{status: string; position: number}> {
     return this.post(`/servo/base?position=${position}`);
+  }
+
+  async baseLeft(): Promise<{status: string}> {
+    return this.post('/servo/base/left');
+  }
+
+  async baseRight(): Promise<{status: string}> {
+    return this.post('/servo/base/right');
+  }
+
+  async baseStop(): Promise<{status: string}> {
+    return this.post('/servo/base/stop');
   }
 
   /**

@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -8,25 +8,16 @@ import {
 } from 'react-native';
 import {WebView} from 'react-native-webview';
 
-import {ActionButton} from '../components/ActionButton';
 import wsAPI from '../services/wsAPI';
 import {colors, radii, spacing} from '../theme';
-import {DEFAULT_SERVO_POSITIONS, ServoPositions, ToastKind} from '../types';
-import {clamp} from '../utils/waterLevel';
+import {ServoPositions, ToastKind} from '../types';
 
 interface CameraScreenProps {
-  onArm: (action: 'open' | 'close') => Promise<void>;
+  onJoint: (joint: keyof ServoPositions, direction: -1 | 0 | 1) => Promise<void>;
   onExit: () => void;
-  onServo: (servo: keyof ServoPositions, position: number) => Promise<void>;
   loadStreamUrl: () => Promise<string>;
   notify: (message: string, kind?: ToastKind) => void;
 }
-
-const BASE_MIN     = 250;   // from reference
-const BASE_MAX     = 450;
-const SHOULDER_MIN = 150;
-const SHOULDER_MAX = 380;
-const SERVO_STEP   = 15;
 
 function createStreamHtml(streamUrl: string) {
   const safeUrl = streamUrl
@@ -41,34 +32,23 @@ function createStreamHtml(streamUrl: string) {
 }
 
 export function CameraScreen({
-  onArm,
+  onJoint,
   onExit,
-  onServo,
   loadStreamUrl,
   notify,
 }: CameraScreenProps) {
   const [streamUrl, setStreamUrl]     = useState('');
   const [streamState, setStreamState] = useState<'loading' | 'live' | 'error'>('loading');
-  const [busyAction, setBusyAction]   = useState<'open' | 'close' | null>(null);
 
-  const basePos     = useRef(DEFAULT_SERVO_POSITIONS.base);
-  const shoulderPos = useRef(DEFAULT_SERVO_POSITIONS.shoulder);
-
-  // Sync servo positions from ESP32 on mount so claw/shoulder stay in sync
   useEffect(() => {
-    // Connect WebSocket on mount, disconnect on unmount
     wsAPI.connect();
-    // Fetch initial servo positions via HTTP for sync
-    import('../services/httpAPI').then(({default: httpAPI}) => {
-      httpAPI.getServoStatus()
-        .then(s => {
-          basePos.current     = s.base;
-          shoulderPos.current = s.shoulder;
-        })
-        .catch(() => undefined);
-    });
     return () => wsAPI.disconnect();
   }, []);
+
+  useEffect(() => () => {
+    for (const joint of ['base', 'shoulder', 'elbow', 'gripper'] as const)
+      void onJoint(joint, 0).catch(() => undefined);
+  }, [onJoint]);
 
   // ── Stream ──────────────────────────────────────────────────────────────
 
@@ -97,24 +77,22 @@ export function CameraScreen({
   const motorLeft  = () => wsAPI.motorLeft();
   const motorRight = () => wsAPI.motorRight();
 
-  // ── Claw (base servo) — continuous rotation, time-based ────────────────
+  // ── Individual positional servo controls ───────────────────────────────
 
-  const clawLeft  = () => wsAPI.moveBase(-1);   // -1 = rev
-  const clawRight = () => wsAPI.moveBase(1);    // 1 = fwd
+  const startJoint = (joint: keyof ServoPositions, direction: -1 | 1) => {
+    void onJoint(joint, direction).catch(() => notify(`Failed to move ${joint}.`, 'danger'));
+  };
+  // ── Shoulder ────────────────────────────────────────────────────────────
 
-  // ── Shoulder — continuous rotation, time-based ───────────────────────────
-
-  const shoulderUp   = () => wsAPI.moveShoulder(1);
-  const shoulderDown = () => wsAPI.moveShoulder(-1);
+  // The home (raised/retracted) positions have lower PWM counts.
+  const shoulderUp   = () => startJoint('shoulder', -1);
+  const shoulderDown = () => startJoint('shoulder', 1);
+  const elbowUp      = () => startJoint('elbow', -1);
+  const elbowDown    = () => startJoint('elbow', 1);
+  const gripperOpen  = () => startJoint('gripper', 1);
+  const gripperClose = () => startJoint('gripper', -1);
 
   // ── Arm sequence via WebSocket ──────────────────────────────────────────
-
-  const runArmAction = async (action: 'open' | 'close') => {
-    setBusyAction(action);
-    wsAPI[action === 'open' ? 'armOpen' : 'armClose']();
-    // Arm takes ~5s — just clear busy after timeout
-    setTimeout(() => setBusyAction(null), 6000);
-  };
 
   return (
     <View style={styles.screen}>
@@ -178,103 +156,58 @@ export function CameraScreen({
           </Pressable>
         </View>
 
-        {/* ── Bottom Controls ── */}
-        <View style={styles.controls}>
-
-          {/* LEFT — Wheels D-pad */}
-          <View style={styles.dpad}>
-            <Text style={styles.label}>WHEELS</Text>
-
-            <Pressable onPressIn={startForward} onPressOut={stopDrive}
-              style={({pressed}) => [styles.btn, styles.btnTop, pressed && styles.btnOn]}>
-              <Text style={styles.btnArrow}>▲</Text>
-              <Text style={styles.btnTxt}>FWD</Text>
-            </Pressable>
-
-            <View style={styles.dRow}>
-              <Pressable onPress={motorLeft}
-                style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
-                <Text style={styles.btnArrow}>◀</Text>
-                <Text style={styles.btnTxt}>LEFT</Text>
-              </Pressable>
-              <View style={styles.dCenter} />
-              <Pressable onPress={motorRight}
-                style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
-                <Text style={styles.btnArrow}>▶</Text>
-                <Text style={styles.btnTxt}>RIGHT</Text>
-              </Pressable>
-            </View>
-
-            <Pressable onPressIn={startBackward} onPressOut={stopDrive}
-              style={({pressed}) => [styles.btn, styles.btnBottom, pressed && styles.btnOn]}>
-              <Text style={styles.btnArrow}>▼</Text>
-              <Text style={styles.btnTxt}>REV</Text>
-            </Pressable>
-          </View>
-
-          <View style={styles.divider} />
-
-          {/* CENTER — Claw left/right */}
-          <View style={styles.clawPanel}>
-            <Text style={styles.label}>CLAW</Text>
-            <View style={styles.clawRow}>
-              <Pressable onPress={clawLeft}
-                style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
-                <Text style={styles.btnArrow}>◀</Text>
-                <Text style={styles.btnTxt}>LEFT</Text>
-              </Pressable>
-              <Pressable onPress={clawRight}
-                style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
-                <Text style={styles.btnArrow}>▶</Text>
-                <Text style={styles.btnTxt}>RIGHT</Text>
-              </Pressable>
+      </View>
+      <View style={styles.controls}>
+        <Text style={styles.label}>WHEELS</Text>
+        <View style={styles.controlRow}>
+          <Pressable onPressIn={startForward} onPressOut={stopDrive} style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
+            <Text style={styles.btnArrow}>▲</Text><Text style={styles.btnTxt}>FWD</Text>
+          </Pressable>
+          <Pressable onPress={motorLeft} style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
+            <Text style={styles.btnArrow}>◀</Text><Text style={styles.btnTxt}>LEFT</Text>
+          </Pressable>
+          <Pressable onPress={motorRight} style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
+            <Text style={styles.btnArrow}>▶</Text><Text style={styles.btnTxt}>RIGHT</Text>
+          </Pressable>
+          <Pressable onPressIn={startBackward} onPressOut={stopDrive} style={({pressed}) => [styles.btn, pressed && styles.btnOn]}>
+            <Text style={styles.btnArrow}>▼</Text><Text style={styles.btnTxt}>REV</Text>
+          </Pressable>
+        </View>
+        <Text style={styles.label}>ARM</Text>
+        <View style={styles.controlRow}>
+          <View style={styles.jointGroup}>
+            <Text style={styles.jointLabel}>BASE</Text>
+            <View style={styles.jointRow}>
+              <Pressable onPress={() => startJoint('base', 1)} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>LEFT</Text></Pressable>
+              <Pressable onPress={() => startJoint('base', -1)} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>RIGHT</Text></Pressable>
             </View>
           </View>
-
-          <View style={styles.divider} />
-
-          {/* RIGHT — Shoulder + Arm */}
-          <View style={styles.armPanel}>
-            <Text style={styles.label}>ARM</Text>
-
-            <View style={styles.shRow}>
-              <Pressable onPress={shoulderUp}
-                style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}>
-                <Text style={styles.shArrow}>↑</Text>
-                <Text style={styles.shTxt}>UP</Text>
-              </Pressable>
-              <Pressable onPress={shoulderDown}
-                style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}>
-                <Text style={styles.shArrow}>↓</Text>
-                <Text style={styles.shTxt}>DOWN</Text>
-              </Pressable>
+          <View style={styles.jointGroup}>
+            <Text style={styles.jointLabel}>SHOULDER</Text>
+            <View style={styles.jointRow}>
+              <Pressable onPress={shoulderUp} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>UP</Text></Pressable>
+              <Pressable onPress={shoulderDown} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>DOWN</Text></Pressable>
             </View>
-
-            <ActionButton
-              disabled={busyAction !== null}
-              icon="↑"
-              label={busyAction === 'open' ? 'OPENING…' : 'OPEN ARM'}
-              onPress={() => runArmAction('open')}
-              style={styles.armBtn}
-              variant="success"
-            />
-            <ActionButton
-              disabled={busyAction !== null}
-              icon="↓"
-              label={busyAction === 'close' ? 'CLOSING…' : 'CLOSE ARM'}
-              onPress={() => runArmAction('close')}
-              style={[styles.armBtn, {marginBottom: 0}]}
-              variant="danger"
-            />
           </View>
-
+          <View style={styles.jointGroup}>
+            <Text style={styles.jointLabel}>ELBOW</Text>
+            <View style={styles.jointRow}>
+              <Pressable onPress={elbowUp} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>UP</Text></Pressable>
+              <Pressable onPress={elbowDown} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>DOWN</Text></Pressable>
+            </View>
+          </View>
+          <View style={styles.jointGroup}>
+            <Text style={styles.jointLabel}>CLAW</Text>
+            <View style={styles.jointRow}>
+              <Pressable onPress={gripperOpen} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>OPEN</Text></Pressable>
+              <Pressable onPress={gripperClose} style={({pressed}) => [styles.shBtn, pressed && styles.shBtnOn]}><Text style={styles.shTxt}>CLOSE</Text></Pressable>
+            </View>
+          </View>
         </View>
       </View>
     </View>
   );
 }
-
-const BTN = 52;
 
 const styles = StyleSheet.create({
   screen:      { flex: 1, backgroundColor: colors.black },
@@ -283,7 +216,7 @@ const styles = StyleSheet.create({
 
   cameraPlaceholder: {
     flex: 1, alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: spacing.xl, paddingBottom: 200,
+    paddingHorizontal: spacing.xl,
   },
   cameraIcon:  { color: '#555962', fontSize: 42, fontWeight: '800' },
   cameraTitle: { color: colors.white, fontSize: 15, fontWeight: '700', marginTop: spacing.md },
@@ -320,38 +253,22 @@ const styles = StyleSheet.create({
 
   // ── Controls ─────────────────────────────────────────────────────────────
   controls: {
-    position: 'absolute', zIndex: 2,
-    left: 0, right: 0, bottom: 0,
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around',
-    paddingHorizontal: spacing.md,
-    paddingTop: spacing.md,
-    paddingBottom: spacing.lg,
+    backgroundColor: '#101319',
+    borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: spacing.md, paddingTop: spacing.sm, paddingBottom: spacing.md,
   },
   label: {
-    color: 'rgba(255,255,255,0.45)', fontSize: 8, fontWeight: '800',
-    letterSpacing: 1.2, textAlign: 'center', marginBottom: 8,
-    textShadowColor: 'rgba(0,0,0,0.9)',
-    textShadowOffset: {width: 0, height: 1}, textShadowRadius: 4,
+    color: 'rgba(255,255,255,0.7)', fontSize: 9, fontWeight: '800',
+    letterSpacing: 1.2, marginBottom: 5, marginTop: 4,
   },
-  divider: {
-    width: 1, alignSelf: 'stretch',
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    marginHorizontal: spacing.sm,
-  },
-
-  // ── D-pad ────────────────────────────────────────────────────────────────
-  dpad:   { alignItems: 'center' },
-  dRow:   { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  dCenter: { width: 24, height: 24 },
+  controlRow: { flexDirection: 'row', gap: 6, marginBottom: 6 },
 
   btn: {
-    width: BTN, height: BTN, borderRadius: 12,
-    backgroundColor: 'transparent',
+    flex: 1, minHeight: 48, borderRadius: 10,
+    backgroundColor: '#1B222C',
     borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.25)',
     alignItems: 'center', justifyContent: 'center',
   },
-  btnTop:    { marginBottom: 4 },
-  btnBottom: { marginTop: 4 },
   btnOn: {
     backgroundColor: 'rgba(60,140,255,0.25)',
     borderColor: 'rgba(100,180,255,1)',
@@ -362,23 +279,18 @@ const styles = StyleSheet.create({
     textShadowOffset: {width: 0, height: 1}, textShadowRadius: 3,
   },
   btnTxt: {
-    color: 'rgba(255,255,255,0.5)', fontSize: 7, fontWeight: '800',
+    color: 'rgba(255,255,255,0.8)', fontSize: 9, fontWeight: '800',
     letterSpacing: 0.5, marginTop: 1,
     textShadowColor: 'rgba(0,0,0,0.9)',
     textShadowOffset: {width: 0, height: 1}, textShadowRadius: 3,
   },
 
-  // ── Claw panel ───────────────────────────────────────────────────────────
-  clawPanel: { alignItems: 'center', justifyContent: 'center' },
-  clawRow:   { flexDirection: 'row', gap: 8, marginTop: 8 },
-
-  // ── Arm panel ────────────────────────────────────────────────────────────
-  armPanel: { flex: 1, alignItems: 'stretch', maxWidth: 190 },
-
-  shRow: { flexDirection: 'row', gap: 6, marginBottom: 6 },
+  jointGroup: { flex: 1, minWidth: 0 },
+  jointLabel: { color: colors.warning, fontSize: 8, fontWeight: '800', marginBottom: 4, textAlign: 'center' },
+  jointRow: { flexDirection: 'row', gap: 3 },
   shBtn: {
-    flex: 1, height: 44, borderRadius: 10,
-    backgroundColor: 'transparent',
+    flex: 1, minHeight: 44, borderRadius: 8,
+    backgroundColor: '#2A2319',
     borderWidth: 1.5, borderColor: 'rgba(255,185,80,0.4)',
     alignItems: 'center', justifyContent: 'center',
   },
@@ -386,14 +298,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,185,80,0.2)',
     borderColor: 'rgba(255,185,80,1)',
   },
-  shArrow: {
-    color: colors.warning, fontSize: 16, fontWeight: '800', lineHeight: 18,
-    textShadowColor: 'rgba(0,0,0,0.9)',
-    textShadowOffset: {width: 0, height: 1}, textShadowRadius: 3,
-  },
   shTxt: {
-    color: colors.warning, fontSize: 7, fontWeight: '800', letterSpacing: 0.5,
+    color: colors.warning, fontSize: 8, fontWeight: '800',
   },
-
-  armBtn: { marginBottom: 6, minHeight: 44 },
 });

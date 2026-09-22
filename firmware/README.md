@@ -22,6 +22,8 @@ ESP32-based firmware for the Drain Guard IoT system.
 4. PlatformIO will auto-install dependencies
 
 ### Arduino IDE (Alternative)
+The BLE controller app and firmware in this repository are validated through the PlatformIO build in `firmware/src`. Use the generated PlatformIO `firmware.bin` for the matching Android APK. The older single-file Arduino sketch is retained only as a legacy reference and does not implement the current BLE controller protocol.
+
 1. Install [Arduino IDE](https://www.arduino.cc/en/software)
 2. Add ESP32 board support:
    - Go to File → Preferences
@@ -42,7 +44,7 @@ Install these libraries via Arduino Library Manager or PlatformIO:
 
 ### Bluetooth WiFi provisioning (recommended)
 
-The firmware advertises a BLE setup service as `DrainGuard-XXXX`. Use the mobile app's **WiFi Setup** screen to scan for the robot, send WiFi credentials, optionally configure the telemetry endpoint, and receive live connection status. Successful credentials are persisted in ESP32 NVS and reused after restart.
+The firmware advertises a secure BLE service as `DrainGuard-XXXX`. The Android app uses it for persistent sensor status, drain-arm and servo controls, plus optional WiFi provisioning. Successful WiFi credentials are persisted in ESP32 NVS and reused after restart.
 
 Provisioning uses a non-blocking 30-second WiFi attempt. If it fails, the robot continues operating and BLE remains available for another attempt. See [`docs/bluetooth-provisioning.md`](../docs/bluetooth-provisioning.md) for the protocol, native mobile permissions, security model, and complete setup instructions.
 
@@ -52,13 +54,13 @@ The DevKit keeps a private WPA2 hotspot active independently of the optional BLE
 
 | Device | Network role | Address |
 |---|---|---|
-| ESP32 DevKit V1 | Hotspot and robot API | `192.168.4.1` |
+| ESP32 DevKit V1 | BLE controller, hotspot, and fallback HTTP API | `192.168.4.1` |
 | ESP32-CAM | Hotspot client and video server | `192.168.4.50` |
 | Mobile phone | Hotspot client | Assigned automatically |
 
 The default hotspot is `DrainGuard-Robot` with password `DrainGuard123`. Change `DRAINGUARD_AP_SSID` and `DRAINGUARD_AP_PASSWORD` in `src/config.h` before deployment, then make the identical change in `esp32cam/esp32cam.ino`. The password must contain at least eight characters.
 
-This uses `WIFI_AP_STA`, so local control and video continue working without a router while the station interface can still use BLE-provisioned WiFi for telemetry. The ESP32-CAM communicates entirely over WiFi; there are no GPIO data wires between the two ESP32 boards.
+This uses `WIFI_AP_STA`, so video continues working without a router while the station interface can still use BLE-provisioned WiFi for telemetry. Normal control and status traffic use BLE. The ESP32-CAM communicates entirely over WiFi; there are no GPIO data wires between the two ESP32 boards.
 
 ### Compile-time fallback
 
@@ -128,9 +130,9 @@ Upload and power the DevKit firmware first so its hotspot is available when the 
 
 1. Power the ESP32 DevKit and wait for `DrainGuard hotspot ready` in Serial Monitor.
 2. Power the ESP32-CAM and wait for it to connect at `192.168.4.50`.
-3. Connect the phone to the `DrainGuard-Robot` WiFi network. A “no internet” notice is expected in local-only mode.
-4. In the app's **Settings**, set **Device IP address** to `192.168.4.1`.
-5. Test `http://192.168.4.50/capture` in the phone browser, then open **Live Camera** in the app.
+3. In the Android app's **Settings**, scan for and pair with `DrainGuard-XXXX`. Status and controls now use BLE.
+4. Connect the phone to `DrainGuard-Robot` only when camera access is needed. A “no internet” notice is expected in local-only mode.
+5. Keep the camera gateway at `192.168.4.1`, test `http://192.168.4.50/capture` in the phone browser, then open **Live Camera** in the app.
 
 ## API Endpoints
 
@@ -165,10 +167,10 @@ HTTP server ready on hotspot: http://192.168.4.1
 - Valid range: 2-400 cm
 
 ### 3. Motor Test
-- Send POST request to `/api/drain/open`
-- Motors should run forward for configured time
-- Send POST request to `/api/drain/close`
-- Motors should run backward
+- Pair the Android app over BLE
+- Tap the open control; motors should run forward for the configured time
+- Tap the close control; motors should run backward
+- The HTTP endpoints remain available for diagnostic testing
 
 ### 4. GPS Test
 - Takes 1-3 minutes for initial GPS fix (must be outdoors)
