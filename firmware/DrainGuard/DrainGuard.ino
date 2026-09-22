@@ -377,7 +377,9 @@ void stopMotors() {
 #define SERVO_STEPS_PER_PRESS 20
 
 // Base servo: small step per press (LEFT/RIGHT buttons)
-#define SERVO_BASE_STEPS_PER_PRESS 5   // smaller step for base rotation
+#define SERVO_BASE_STEPS_PER_PRESS    10   // smaller step for base rotation
+// Gripper servo: small step per press (OPEN/CLOSE buttons)
+#define SERVO_GRIPPER_STEPS_PER_PRESS 10   // smaller step for claw open/close
 
 // Per-channel speed multipliers (1 = normal, 2 = half speed, 3 = third speed, etc.)
 // Increased all to prevent mechanical stress
@@ -389,8 +391,10 @@ void stopMotors() {
 void startServoMove(uint8_t ch, int direction) {
   if (ch > SERVO_GRIPPER || armSequenceRunning) return;
   
-  // Base servo uses smaller steps for precise rotation control
-  int steps = (ch == SERVO_BASE) ? SERVO_BASE_STEPS_PER_PRESS : SERVO_STEPS_PER_PRESS;
+  // Base and Gripper use smaller steps for precise control
+  int steps = SERVO_STEPS_PER_PRESS;
+  if (ch == SERVO_BASE)    steps = SERVO_BASE_STEPS_PER_PRESS;
+  if (ch == SERVO_GRIPPER) steps = SERVO_GRIPPER_STEPS_PER_PRESS;
   
   const int target = (int)getServoPosition(ch) +
     (direction < 0 ? -steps : steps);
