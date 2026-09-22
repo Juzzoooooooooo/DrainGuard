@@ -83,14 +83,15 @@ export function CameraScreen({
     void onJoint(joint, direction).catch(() => notify(`Failed to move ${joint}.`, 'danger'));
   };
   // ── Shoulder ────────────────────────────────────────────────────────────
-
-  // The home (raised/retracted) positions have lower PWM counts.
+  // SHOULDER ticks: 150=raised (home/up), 380=lowered (down)
+  // direction -1 → ticks decrease → arm raises (UP)
+  // direction +1 → ticks increase → arm lowers (DOWN)
   const shoulderUp   = () => startJoint('shoulder', -1);
-  const shoulderDown = () => startJoint('shoulder', 1);
+  const shoulderDown = () => startJoint('shoulder',  1);
   const elbowUp      = () => startJoint('elbow', -1);
   const elbowDown    = () => startJoint('elbow', 1);
-  const gripperOpen  = () => startJoint('gripper', 1);
-  const gripperClose = () => startJoint('gripper', -1);
+  const gripperOpen  = () => startJoint('gripper', -1);  // ticks decrease → 410→350 = open
+  const gripperClose = () => startJoint('gripper',  1);  // ticks increase → 410→510 = close
 
   // ── Arm sequence via WebSocket ──────────────────────────────────────────
 

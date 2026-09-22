@@ -83,15 +83,23 @@
 #define SERVO_ELBOW         2   // servo3 — elbow
 #define SERVO_GRIPPER       3   // servo4 — gripper
 
-// Exact values from reference Robot_arm.ino — tested and working
-#define SERVO_BASE_MIN     250
-#define SERVO_BASE_MAX     450
-#define SERVO_SHOULDER_MIN 150
-#define SERVO_SHOULDER_MAX 380
-#define SERVO_ELBOW_MIN    300
-#define SERVO_ELBOW_MAX    380
-#define SERVO_GRIPPER_MIN  410
-#define SERVO_GRIPPER_MAX  510
+// Exact values from reference Robot_arm.ino — adjusted for full range of motion
+// MIN values extended below home so UP button works
+// MAX values extended above reference to allow full DOWN movement
+#define SERVO_BASE_MIN       250
+#define SERVO_BASE_MAX       450
+#define SERVO_SHOULDER_MIN   120   // raised from 80 — prevents hitting mechanical stop
+#define SERVO_SHOULDER_MAX   450   // extended beyond 380 for full DOWN range
+#define SERVO_ELBOW_MIN      250   // raised from 200 — prevents hitting mechanical stop
+#define SERVO_ELBOW_MAX      450   // extended beyond 380 for full DOWN range
+#define SERVO_GRIPPER_MIN    350   // extended below 410 for CLOSE
+#define SERVO_GRIPPER_MAX    510   // home=410 is between MIN-MAX now
+
+// Home positions (arm starts here on boot)
+#define SERVO_BASE_HOME      330
+#define SERVO_SHOULDER_HOME  150
+#define SERVO_ELBOW_HOME     300
+#define SERVO_GRIPPER_HOME   410   // open (middle of range)
 
 // ── Alert thresholds ─────────────────────────────────────────────────────────
 
@@ -290,7 +298,22 @@ void checkAlerts() {
   if (state.distance < CRITICAL_DIST && !state.alertSent) {
     Serial.println("[ALERT] Critical water level!");
     state.alertSent = true;
+    
+    // Send SMS alert
     sendSMS(ALERT_PHONE, "CRITICAL: DrainGuard water level is high!");
+    
+    // Send push notification via WebSocket to all connected clients
+    StaticJsonDocument<256> alert;
+    alert["type"] = "alert";
+    alert["level"] = "critical";
+    alert["message"] = "High water level detected!";
+    alert["distance"] = state.distance;
+    alert["waterLevel"] = state.waterLevel;
+    String alertMsg;
+    serializeJson(alert, alertMsg);
+    wsServer.broadcastTXT(alertMsg);
+    Serial.println("[WS] Alert broadcast to all clients");
+    
     if (AUTO_OPEN_DRAIN) openDrain();
   } else if (state.distance > WARNING_DIST) {
     state.alertSent = false;
@@ -353,13 +376,35 @@ void stopMotors() {
 #define SERVO_STEP_INTERVAL_MS 10
 #define SERVO_STEPS_PER_PRESS 20
 
+// Base servo: small step per press (LEFT/RIGHT buttons)
+#define SERVO_BASE_STEPS_PER_PRESS 5   // smaller step for base rotation
+
+// Per-channel speed multipliers (1 = normal, 2 = half speed, 3 = third speed, etc.)
+// Increased all to prevent mechanical stress
+#define SERVO_BASE_SPEED     2   // slower to protect base motor
+#define SERVO_SHOULDER_SPEED 8   // SUPER SLOW — heavy arm section, prevents damage
+#define SERVO_ELBOW_SPEED    3   // slow — prevents jerky motion
+#define SERVO_GRIPPER_SPEED  2   // moderate — lighter load
+
 void startServoMove(uint8_t ch, int direction) {
   if (ch > SERVO_GRIPPER || armSequenceRunning) return;
+  
+  // Base servo uses smaller steps for precise rotation control
+  int steps = (ch == SERVO_BASE) ? SERVO_BASE_STEPS_PER_PRESS : SERVO_STEPS_PER_PRESS;
+  
   const int target = (int)getServoPosition(ch) +
-    (direction < 0 ? -SERVO_STEPS_PER_PRESS : SERVO_STEPS_PER_PRESS);
+    (direction < 0 ? -steps : steps);
   servoTargetPos[ch] = clampServoPosition(ch, target);
   servoNextStepAt[ch] = millis();
-  servoManualStopAt[ch] = millis() + SERVO_STEP_INTERVAL_MS * SERVO_STEPS_PER_PRESS;
+  // Apply per-channel speed to manual stop timeout
+  uint8_t speed = 1;
+  switch (ch) {
+    case SERVO_BASE:     speed = SERVO_BASE_SPEED; break;
+    case SERVO_SHOULDER: speed = SERVO_SHOULDER_SPEED; break;
+    case SERVO_ELBOW:    speed = SERVO_ELBOW_SPEED; break;
+    case SERVO_GRIPPER:  speed = SERVO_GRIPPER_SPEED; break;
+  }
+  servoManualStopAt[ch] = millis() + SERVO_STEP_INTERVAL_MS * steps * speed;
 }
 
 void stopServoMove(uint8_t ch) {
@@ -383,7 +428,15 @@ void updateServoMoves() {
       case SERVO_ELBOW: elbowPos = next; break;
       case SERVO_GRIPPER: gripperPos = next; break;
     }
-    servoNextStepAt[ch] = now + SERVO_STEP_INTERVAL_MS;
+    // Apply per-channel speed multiplier
+    uint8_t speed = 1;
+    switch (ch) {
+      case SERVO_BASE:     speed = SERVO_BASE_SPEED; break;
+      case SERVO_SHOULDER: speed = SERVO_SHOULDER_SPEED; break;
+      case SERVO_ELBOW:    speed = SERVO_ELBOW_SPEED; break;
+      case SERVO_GRIPPER:  speed = SERVO_GRIPPER_SPEED; break;
+    }
+    servoNextStepAt[ch] = now + SERVO_STEP_INTERVAL_MS * speed;
   }
 }
 

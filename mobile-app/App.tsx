@@ -17,6 +17,8 @@ import {DashboardScreen} from './src/screens/DashboardScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {DrainGuardApi} from './src/services/api';
 import httpAPI from './src/services/httpAPI';
+import wsAPI from './src/services/wsAPI';
+import notificationService from './src/services/notificationService';
 import {
   loadSettings as loadSavedSettings,
   saveSettings as persistSettings,
@@ -72,6 +74,33 @@ function App() {
 
   useEffect(() => {
     let mounted = true;
+    
+    // Initialize notification service
+    notificationService.initialize();
+    
+    // Connect to WebSocket
+    wsAPI.connect();
+    
+    // Listen for alert messages from ESP32
+    const unsubscribe = wsAPI.onMessage((data) => {
+      if (data.type === 'alert' && mounted) {
+        const level = data.level as string;
+        const message = data.message as string;
+        const distance = data.distance as number;
+        const waterLevel = data.waterLevel as number;
+        
+        // Show push notification
+        notificationService.showAlert(
+          'DrainGuard Alert',
+          `${message} Distance: ${distance?.toFixed(1)}cm, Level: ${waterLevel?.toFixed(1)}cm`,
+          level === 'critical' ? 'critical' : level === 'warning' ? 'warning' : 'info',
+        );
+        
+        // Also show in-app toast
+        notify(message, level === 'critical' ? 'danger' : level === 'warning' ? 'warning' : 'info');
+      }
+    });
+    
     loadSavedSettings()
       .then(savedSettings => {
         if (mounted) setSettings(savedSettings);
@@ -82,7 +111,12 @@ function App() {
       .finally(() => {
         if (mounted) setReady(true);
       });
-    return () => { mounted = false; };
+    
+    return () => {
+      mounted = false;
+      unsubscribe();
+      wsAPI.disconnect();
+    };
   }, [notify]);
 
   useEffect(() => {
